@@ -45,7 +45,8 @@ enum TTY {
             cc[Int(VTIME)] = 0
         }
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
-        write("\u{1B}[?1049h\u{1B}[?25l")
+        // Save the window title (xterm title stack) so quitting can put it back.
+        write("\u{1B}[22;0t\u{1B}[?1049h\u{1B}[?25l")
 
         for (sig, handler) in [(SIGINT, onQuit), (SIGTERM, onQuit), (SIGWINCH, onResize)] {
             signal(sig, SIG_IGN)
@@ -58,7 +59,9 @@ enum TTY {
 
     static func restore() {
         guard var saved = original else { return }
-        write("\u{1B}[0m\u{1B}[?25h\u{1B}[?1049l")
+        // An empty title first, for terminals without a title stack.
+        write("\u{1B}[0m\u{1B}[?25h\u{1B}[?1049l\u{1B}]2;\u{07}\u{1B}[23;0t")
+        lastTitle = nil
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved)
         original = nil
     }
@@ -75,6 +78,17 @@ enum TTY {
         }
     }
 
+    private static var lastTitle: String?
+
+    /// Sets the terminal window's title, only when it changes. Control
+    /// characters are dropped, so metadata can't inject escape sequences.
+    static func setTitle(_ title: String) {
+        let clean = title.printable
+        guard clean != lastTitle else { return }
+        lastTitle = clean
+        write("\u{1B}]2;\(clean)\u{07}")
+    }
+
     static func move(row: Int, col: Int = 1) -> String { "\u{1B}[\(row);\(col)H" }
 
     // MARK: - Keys
@@ -87,25 +101,22 @@ enum TTY {
         while i < bytes.count {
             let b = bytes[i]
             if b == 0x1B {
-                if i + 2 < bytes.count, bytes[i + 1] == 0x5B || bytes[i + 1] == 0x4F {
-                    let code = bytes[i + 2]
+                if i + 1 < bytes.count, bytes[i + 1] == 0x5B {
+                    // CSI: parameters 0x30–0x3F, intermediates 0x20–0x2F, then a final
+                    // byte 0x40–0x7E. Modifiers (ESC [ 1 ; 2 A) are read and dropped.
+                    var j = i + 2
+                    while j < bytes.count, (0x30...0x3F).contains(bytes[j]) { j += 1 }
+                    let params = String(decoding: bytes[(i + 2)..<j], as: UTF8.self)
+                    while j < bytes.count, (0x20...0x2F).contains(bytes[j]) { j += 1 }
+                    // An unfinished sequence ends the read.
+                    guard j < bytes.count, (0x40...0x7E).contains(bytes[j]) else { break }
+                    let first = params.split(separator: ";").first.map(String.init) ?? ""
+                    if let key = csiKey(final: bytes[j], first: first) { keys.append(key) }
+                    i = j + 1
+                } else if i + 2 < bytes.count, bytes[i + 1] == 0x4F {
+                    // SS3: ESC O and one final byte.
+                    if let key = csiKey(final: bytes[i + 2], first: "") { keys.append(key) }
                     i += 3
-                    switch code {
-                    case 0x41: keys.append(.up)
-                    case 0x42: keys.append(.down)
-                    case 0x43: keys.append(.right)
-                    case 0x44: keys.append(.left)
-                    case 0x48: keys.append(.home)
-                    case 0x46: keys.append(.end)
-                    case 0x35, 0x36, 0x31, 0x34:
-                        // ESC [ 5 ~ (page up), 6 ~ (page down), 1 ~ / 4 ~ (home / end)
-                        if i < bytes.count, bytes[i] == 0x7E { i += 1 }
-                        keys.append([0x35: Key.pageUp, 0x36: .pageDown, 0x31: .home, 0x34: .end][code]!)
-                    default:
-                        // Skip any other CSI sequence to its final byte.
-                        while i < bytes.count, !(0x40...0x7E).contains(bytes[i]) { i += 1 }
-                        i += 1
-                    }
                 } else {
                     keys.append(.escape)
                     i += 1
@@ -132,22 +143,87 @@ enum TTY {
         }
         return keys
     }
+
+    private static func csiKey(final: UInt8, first: String) -> Key? {
+        switch final {
+        case 0x41: .up
+        case 0x42: .down
+        case 0x43: .right
+        case 0x44: .left
+        case 0x48: .home
+        case 0x46: .end
+        case 0x7E:
+            switch first {
+            case "1", "7": .home
+            case "4", "8": .end
+            case "5": .pageUp
+            case "6": .pageDown
+            default: nil
+            }
+        default: nil
+        }
+    }
 }
 
 // MARK: - Text fitting
 
+extension Character {
+    /// Terminal columns: 2 for East Asian wide and emoji, else 1.
+    var columns: Int {
+        guard let scalar = unicodeScalars.first else { return 0 }
+        if scalar.properties.isEmojiPresentation || unicodeScalars.contains("\u{FE0F}") { return 2 }
+        switch scalar.value {
+        case 0x1100...0x115F, 0x2E80...0x303E, 0x3041...0x33FF, 0x3400...0x4DBF, 0x4E00...0x9FFF,
+             0xA000...0xA4CF, 0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE30...0xFE4F, 0xFF00...0xFF60,
+             0xFFE0...0xFFE6, 0x20000...0x3FFFD:
+            return 2
+        default:
+            return 1
+        }
+    }
+}
+
 extension String {
-    /// Clipped to `width` columns, with an ellipsis when cut.
+    /// Width in terminal columns, ignoring ANSI styling.
+    var columns: Int {
+        var total = 0
+        var inEscape = false
+        for c in self {
+            if inEscape {
+                if c.isLetter { inEscape = false }
+            } else if c == "\u{1B}" {
+                inEscape = true
+            } else {
+                total += c.columns
+            }
+        }
+        return total
+    }
+
+    /// Without control characters (metadata is untrusted).
+    var printable: String {
+        String(unicodeScalars.filter { $0.properties.generalCategory != .control }.map(Character.init))
+    }
+
+    /// Clipped to `width` columns, with an ellipsis when cut. Plain text only.
     func fitted(_ width: Int) -> String {
         guard width > 0 else { return "" }
-        if count <= width { return self }
-        return String(prefix(max(0, width - 1))) + "…"
+        let text = printable
+        if text.columns <= width { return text }
+        var out = ""
+        var used = 0
+        for c in text {
+            if used + c.columns > width - 1 { break }
+            out.append(c)
+            used += c.columns
+        }
+        return out + "…"
     }
 
     /// Clipped and padded to exactly `width` columns.
     func padded(_ width: Int) -> String {
         let f = fitted(width)
-        return f + String(repeating: " ", count: max(0, width - f.count))
+        return f + String(repeating: " ", count: max(0, width - f.columns))
     }
 }
 

@@ -5,10 +5,13 @@
 //
 //  The full-screen browser: libraries → artists → albums → tracks, a queue
 //  page, and the now-playing bar. Everything runs on the main actor; the
-//  screen is redrawn whole after every key and twice a second.
+//  screen is redrawn whole after every key and twice a second. When the
+//  network changes or the server stops answering, the server is probed again
+//  and playback moves to the new address.
 //
 
 import Foundation
+import Network
 
 final class CLIApp {
     private enum Kind {
@@ -37,7 +40,6 @@ final class CLIApp {
         }
     }
 
-    private let connection: CLIConnection
     private let network = PlexNetworkManager.shared
     private let player: CLIPlayer
     private var stack: [Page] = []
@@ -49,9 +51,16 @@ final class CLIApp {
     private var timer: DispatchSourceTimer?
     private var input: DispatchSourceRead?
     private var quitting = false
+    private var pathMonitor: NWPathMonitor?
+    private var sawFirstPath = false
+    private var pathChange: DispatchWorkItem?
+    private var reconnecting = false
+    private var lastReconnect = Date.distantPast
+
+    /// The player owns the connection, so a reconnect changes it in one place.
+    private var connection: CLIConnection { player.connection }
 
     init(connection: CLIConnection) {
-        self.connection = connection
         self.player = CLIPlayer(connection: connection)
     }
 
@@ -79,13 +88,22 @@ final class CLIApp {
         timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
         timer.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                if let message = self?.player.tick() { self?.flash(message) }
-                self?.spinner += 1
-                self?.draw()
+                guard let self else { return }
+                if let message = self.player.tick() { self.flash(message) }
+                if self.player.needsReconnect, Date().timeIntervalSince(self.lastReconnect) > 10 { self.reconnect() }
+                self.spinner += 1
+                self.draw()
             }
         }
         timer.resume()
         self.timer = timer
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            MainActor.assumeIsolated { self?.pathChanged(online: path.status == .satisfied) }
+        }
+        monitor.start(queue: .main)
+        pathMonitor = monitor
 
         await loadLibraries()
     }
@@ -106,13 +124,54 @@ final class CLIApp {
         }
     }
 
+    // MARK: - Reconnecting
+
+    /// A network change (after the first report, which is just the current
+    /// state): once it settles, see whether the server is now best reached elsewhere.
+    private func pathChanged(online: Bool) {
+        guard sawFirstPath else { sawFirstPath = true; return }
+        guard online else { return }
+        pathChange?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.reconnect() }
+        }
+        pathChange = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    /// Probes the server again; one probe at a time.
+    private func reconnect() {
+        guard !reconnecting, !quitting else { return }
+        reconnecting = true
+        lastReconnect = Date()
+        let old = connection
+        Task {
+            let new = await CLISignIn.reprobe(old)
+            reconnecting = false
+            guard let new else {
+                if player.needsReconnect { flash("Can't reach \(old.serverName). Trying again…") }
+                return
+            }
+            let moved = new.serverURL != old.serverURL
+            if moved || player.needsReconnect {
+                player.switchConnection(new)
+            }
+            if moved { flash("Reconnected to \(new.serverName)\(new.isRelay ? " (relay)" : "").") }
+        }
+    }
+
     // MARK: - Loading
 
     private func load(_ work: @escaping () async throws -> Void) {
         loading = true
         draw()
         Task {
-            do { try await work() } catch { flash("Plex didn't answer: \(SensitiveDataRedactor.redact(error.localizedDescription))") }
+            do {
+                try await work()
+            } catch {
+                flash("Plex didn't answer: \(SensitiveDataRedactor.redact(error.localizedDescription))")
+                if CLISignIn.isNetworkError(error) { reconnect() }
+            }
             loading = false
             draw()
         }
@@ -328,9 +387,9 @@ final class CLIApp {
         let badge = "\(TTY.accentBG)\(TTY.bold) ◆ REPRISE \(TTY.reset)"
         let crumbs = stack.map(\.title).joined(separator: " › ")
         let server = connection.serverName + (connection.isRelay ? " (relay)" : "")
-        let crumbWidth = max(0, width - 12 - server.count - 3)
+        let crumbWidth = max(0, width - 13 - server.columns - 1)
         out += TTY.move(row: 1) + TTY.clearLine + badge + "  " + TTY.dim + crumbs.fitted(crumbWidth).padded(crumbWidth)
-            + TTY.reset + " " + TTY.dim + server + TTY.reset
+            + TTY.reset + " " + TTY.dim + server.fitted(max(0, width - 14)) + TTY.reset
         out += TTY.move(row: 2) + TTY.clearLine
 
         // List.
@@ -350,14 +409,15 @@ final class CLIApp {
                 let isSelected = v == page.selected
                 let isPlaying = playingKey != nil && row.item?.ratingKey == playingKey
                 let marker = isPlaying ? "\(TTY.pink)♪\(TTY.reset)" : " "
-                let detailWidth = row.detail.count
+                let detail = row.detail.fitted(max(0, width / 3))
+                let detailWidth = detail.columns
                 let titleWidth = max(4, width - 6 - detailWidth)
                 let title = row.title.fitted(titleWidth)
-                let titlePad = String(repeating: " ", count: max(0, titleWidth - visibleLength(title)))
+                let titlePad = String(repeating: " ", count: max(0, titleWidth - title.columns))
                 if isSelected {
-                    out += " \(TTY.accent)❯\(TTY.reset)\(marker) \(TTY.bold)\(title)\(TTY.reset)\(titlePad) \(TTY.dim)\(row.detail)\(TTY.reset)"
+                    out += " \(TTY.accent)❯\(TTY.reset)\(marker) \(TTY.bold)\(title)\(TTY.reset)\(titlePad) \(TTY.dim)\(detail)\(TTY.reset)"
                 } else {
-                    out += "  \(marker) \(title)\(TTY.reset)\(titlePad) \(TTY.dim)\(row.detail)\(TTY.reset)"
+                    out += "  \(marker) \(title)\(TTY.reset)\(titlePad) \(TTY.dim)\(detail)\(TTY.reset)"
                 }
             }
             if visible.isEmpty, !loading {
@@ -376,10 +436,10 @@ final class CLIApp {
             let quality = player.quality(of: track)
             let line = "\(track.title ?? "Untitled")"
             let sub = [track.grandparentTitle, track.parentTitle].compactMap { $0 }.joined(separator: " · ")
-            let left = max(0, width - quality.count - 6)
+            let left = max(0, width - quality.columns - 6)
             let titleText = line.fitted(left)
-            let subText = sub.isEmpty ? "" : (" — " + sub).fitted(max(0, left - titleText.count))
-            let pad = String(repeating: " ", count: max(0, left - titleText.count - subText.count))
+            let subText = sub.isEmpty ? "" : (" — " + sub).fitted(max(0, left - titleText.columns))
+            let pad = String(repeating: " ", count: max(0, left - titleText.columns - subText.columns))
             out += TTY.move(row: rows - 3) + " \(TTY.pink)♪\(TTY.reset) \(TTY.bold)\(titleText)\(TTY.reset)\(TTY.dim)\(subText)\(TTY.reset)\(pad)  \(TTY.dim)\(quality)\(TTY.reset)"
 
             let spin = ["◐", "◓", "◑", "◒"][spinner % 4]
@@ -391,7 +451,9 @@ final class CLIApp {
             let bar = TTY.accent + String(repeating: "━", count: filled) + (filled < barWidth ? "╸" : "")
                 + TTY.reset + TTY.dim + String(repeating: "─", count: max(0, barWidth - filled - 1)) + TTY.reset
             out += TTY.move(row: rows - 2) + " \(TTY.accent)\(icon)\(TTY.reset) \(elapsed) \(bar) \(total)"
+            TTY.setTitle("\(player.isPlaying ? "♪" : "⏸") \(track.title ?? "Untitled")" + (track.grandparentTitle.map { " — \($0)" } ?? ""))
         } else {
+            TTY.setTitle("Reprise")
             out += TTY.move(row: rows - 3) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
         }
 
@@ -399,7 +461,7 @@ final class CLIApp {
         out += TTY.move(row: rows - 1) + TTY.clearLine
         out += TTY.move(row: rows) + TTY.clearLine
         if filtering, let page = stack.last {
-            out += " \(TTY.accent)/\(TTY.reset) \(page.filter)\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ open  esc clear\(TTY.reset)"
+            out += " \(TTY.accent)/\(TTY.reset) \(page.filter.fitted(max(1, width - 20)))\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ open  esc clear\(TTY.reset)"
         } else if let status, Date() < statusUntil {
             out += " \(TTY.pink)\(status.fitted(width - 2))\(TTY.reset)"
         } else if loading {
@@ -409,10 +471,5 @@ final class CLIApp {
             out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
         }
         TTY.write(out)
-    }
-
-    /// Length without ANSI escape sequences.
-    private func visibleLength(_ s: String) -> Int {
-        s.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression).count
     }
 }

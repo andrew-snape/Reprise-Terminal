@@ -40,9 +40,12 @@ struct CLIConfig: Codable {
 
 /// A server reached at one address, with the token its requests use.
 struct CLIConnection {
+    let serverID: String
     let serverName: String
     let serverURL: String
     let token: String
+    /// The account token, for asking plex.tv for the server's addresses again.
+    let accountToken: String
 
     var isRelay: Bool { PlexRelay.isRelayURL(serverURL) }
 }
@@ -94,7 +97,30 @@ enum CLISignIn {
         guard let url = await bestConnection(for: server, token: token) else {
             throw CLISignInError.unreachable(server.name)
         }
-        return CLIConnection(serverName: server.name, serverURL: url, token: token)
+        return CLIConnection(serverID: server.clientIdentifier, serverName: server.name, serverURL: url,
+                             token: token, accountToken: config.authToken)
+    }
+
+    /// The same server probed again, with fresh addresses from plex.tv (they
+    /// change when the network does). Nil when nothing answers.
+    static func reprobe(_ connection: CLIConnection) async -> CLIConnection? {
+        guard let servers = try? await network.getServers(authToken: connection.accountToken),
+              let server = servers.first(where: { $0.clientIdentifier == connection.serverID }) else { return nil }
+        let token = server.accessToken ?? connection.accountToken
+        guard let url = await bestConnection(for: server, token: token) else { return nil }
+        return CLIConnection(serverID: server.clientIdentifier, serverName: server.name, serverURL: url,
+                             token: token, accountToken: connection.accountToken)
+    }
+
+    /// A failure to reach the server at all, as opposed to an answer it gave.
+    nonisolated static func isNetworkError(_ error: Error) -> Bool {
+        if let plex = error as? PlexAPIError, case .networkError = plex { return true }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isNetworkError(underlying)
+        }
+        return false
     }
 
     // MARK: - PIN
