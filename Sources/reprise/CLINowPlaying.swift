@@ -3,7 +3,7 @@
 //  CLINowPlaying.swift
 //  reprise (terminal)
 //
-//  The playing track in Control Centre's Now Playing, and the media keys
+//  The playing track (with its cover) in Control Centre's Now Playing, and the media keys
 //  (play/pause, next, previous, scrubbing) sent to the player. Needs the main
 //  run loop running (RepriseCLI runs RunLoop.main, not dispatchMain).
 //
@@ -13,12 +13,15 @@ import MediaPlayer
 
 final class CLINowPlaying {
     private let player: CLIPlayer
+    private let artwork: CLIArtwork
     private var lastKey: String?
+    private var lastArtwork = -1
     private var lastPlaying: Bool?
     private var lastPublished = Date.distantPast
 
-    init(player: CLIPlayer, onChange: @escaping @MainActor () -> Void) {
+    init(player: CLIPlayer, artwork: CLIArtwork, onChange: @escaping @MainActor () -> Void) {
         self.player = player
+        self.artwork = artwork
         let center = MPRemoteCommandCenter.shared()
         func handle(_ command: MPRemoteCommand, _ action: @escaping @MainActor (CLIPlayer) -> Void) {
             command.isEnabled = true
@@ -52,7 +55,7 @@ final class CLINowPlaying {
         }
     }
 
-    /// Call often; publishes on a change of track or state, and every 5 s for the clock.
+    /// Call often; publishes on a change of track, state or cover, and every 5 s for the clock.
     func update() {
         let center = MPNowPlayingInfoCenter.default()
         guard let track = player.current else {
@@ -64,9 +67,11 @@ final class CLINowPlaying {
             return
         }
         let playing = player.isPlaying
-        guard track.ratingKey != lastKey || playing != lastPlaying || Date().timeIntervalSince(lastPublished) > 5
+        guard track.ratingKey != lastKey || playing != lastPlaying || artwork.version != lastArtwork
+                || Date().timeIntervalSince(lastPublished) > 5
         else { return }
         lastKey = track.ratingKey
+        lastArtwork = artwork.version
         lastPlaying = playing
         lastPublished = Date()
         var info: [String: Any] = [
@@ -78,6 +83,7 @@ final class CLINowPlaying {
         ]
         if let artist = track.grandparentTitle { info[MPMediaItemPropertyArtist] = artist }
         if let album = track.parentTitle { info[MPMediaItemPropertyAlbumTitle] = album }
+        if let cover = artwork.mediaArtwork { info[MPMediaItemPropertyArtwork] = cover }
         center.nowPlayingInfo = info
         center.playbackState = playing ? .playing : .paused
     }

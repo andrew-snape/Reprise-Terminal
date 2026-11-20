@@ -26,9 +26,10 @@ Sources/reprise/
 ├── RepriseCLI.swift    # @main: flags, PlexAPI identity, keeps CLIApp alive, dispatchMain()
 ├── CLISignIn.swift     # CLIConfig (token file), PIN sign-in, server choice, connection ranking
 ├── CLIApp.swift        # pages (libraries → artists → albums → tracks, playlists, queue,
-│                       #   ask results), keys, drawing, reconnects
+│                       #   ask results), Now Playing screen, keys, drawing, reconnects
 ├── CLIAsk.swift        # "ask": Foundation Models reads a request, Plex finds the music
-├── CLINowPlaying.swift # Control Centre Now Playing and media keys
+├── CLIArtwork.swift    # album cover: Plex photo transcode, Matrix-style drawing
+├── CLINowPlaying.swift # Control Centre Now Playing (with cover) and media keys
 ├── CLIPlayer.swift     # AVQueuePlayer, direct/transcode URLs, queue editing, levelling,
 │                       #   slow-start download, saved queue, quality text, Plex reporting
 ├── TTY.swift           # raw mode, alternate screen, signals, key decoding, ANSI styles
@@ -77,9 +78,16 @@ Sources/reprise/
   scrobbled (`markWatched`). "stopped" is sent only when the queue runs out or on quit (waits
   up to 2 s). A new id per track, or a "stopped" mid-queue, makes Plex end the session whose
   file is still being read (-1005 / 503), and AVPlayer waits 29 s to retry.
-- **A track that fails** (`AVPlayerItem.status == .failed`) is skipped with a message,
-  unless the failure is a network error (see Connections). Plex hears "stopped" if it was
-  the last track.
+- **AVPlayer holds two items**: the playing track and the next (`topUp` queues the next as
+  each starts), as the Mac app does. With the whole list loaded, one refused file made
+  AVQueuePlayer run on through the rest ("started Ghosteen at Night Raid"). `n` with the
+  next item queued just advances onto it: loading it afresh asks Plex for a file this
+  session is already reading, which it refuses for a moment.
+- **A track that fails** (`AVPlayerItem.status == .failed`) with a network error is first
+  held with nothing in AVPlayer and loaded again after 1 s (`holdAndRetry`), since a
+  refusal (-1008) is a URL error too; only a second network failure means "Lost <server>"
+  (see Connections). Any other failure is skipped with a message. Plex hears "stopped" if
+  it was the last track.
 - **Timeline reports** go out at once whenever the current `AVPlayerItem` differs from the
   last one reported, so manual skips and restarts are covered. The comparison is by item,
   not index.
@@ -112,8 +120,9 @@ Sources/reprise/
   (-1008, CoreMedia -16849); AVQueuePlayer then skips the item by itself, which looked like
   "starts at a different song each time".
 - **A failed item AVQueuePlayer skipped by itself** (the old item's status is `.failed` when
-  `tick()` sees the change) is not scrobbled: it is retried once after 1 s, then skipped
-  with a message.
+  `tick()` sees the change) is not scrobbled: it is held and retried once after 1 s, then
+  skipped with a message. Two reads of one file on the session (a slow-start download
+  beside AVPlayer's range reads) both complete: tested against the server, Nov 2026.
 - **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into
   `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting. A copy that
   isn't used, or whose item is left, is deleted at once; the folder is also cleared on
@@ -121,6 +130,14 @@ Sources/reprise/
 - **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
   metadata (album gain when one album plays in order), set on the player when a track starts
   (the next item's on `didPlayToEndTime`, so no loud first moment).
+- **Now Playing screen** (`v`): the cover as Matrix-style text, one cell a pixel (a square
+  cover is `2 × rows` cells across): half-width katakana (one column each) and digits in
+  16 shades of coral by brightness (contrast stretched), dark areas empty. While music
+  plays a 0.12 s timer moves drops of light down the columns and flickers a few glyphs;
+  paused, it holds still and isn't redrawn. (Colour half blocks were tried first and
+  looked poor.) Stacked and centred, or beside the words when the window is wide and
+  short. Covers come from `/photo/:/transcode` at 600 px, one fetch per album, and also
+  go to Control Centre.
 - **Never print or log URLs.** File and transcode URLs carry the token. Error text goes
   through `SensitiveDataRedactor.redact`.
 

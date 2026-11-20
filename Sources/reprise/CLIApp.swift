@@ -4,7 +4,8 @@
 //  reprise (terminal)
 //
 //  The full-screen browser: libraries → artists → albums → tracks, playlists,
-//  a queue page, "ask" results, and the now-playing bar. Everything runs on
+//  a queue page, "ask" results, the now-playing bar and a Now Playing screen
+//  with the album cover. Everything runs on
 //  the main actor; the screen is redrawn whole after every key and twice a
 //  second. When the network changes or the server stops answering, the
 //  server is probed again and playback moves to the new address.
@@ -67,6 +68,14 @@ final class CLIApp {
     /// The session being made (and warmed up) while the request is typed; awaited on Enter.
     private var askSession: Task<LanguageModelSession?, Never>?
     private var nowPlaying: CLINowPlaying?
+    private let artwork = CLIArtwork()
+    /// The Now Playing screen (`v`) is showing instead of the list.
+    private var showingNow = false
+    /// What the cover area last drew; it is redrawn only when this changes.
+    private var drawnArt: String?
+    /// The Matrix rain's step, advanced while the Now Playing screen shows music playing.
+    private var rainFrame = 1
+    private var rainTimer: DispatchSourceTimer?
 
     /// The player owns the connection, so a reconnect changes it in one place.
     private var connection: CLIConnection { player.connection }
@@ -79,8 +88,15 @@ final class CLIApp {
 
     func run() async {
         CLIPlayer.clearCache()
-        nowPlaying = CLINowPlaying(player: player, onChange: { [weak self] in self?.draw() })
-        TTY.enter(onResize: { [weak self] in self?.draw() },
+        artwork.onChange = { [weak self] in
+            self?.nowPlaying?.update()
+            self?.draw()
+        }
+        nowPlaying = CLINowPlaying(player: player, artwork: artwork, onChange: { [weak self] in self?.draw() })
+        TTY.enter(onResize: { [weak self] in
+                      self?.drawnArt = nil
+                      self?.draw()
+                  },
                   onQuit: { [weak self] in self?.quit() })
         draw()
 
@@ -108,6 +124,7 @@ final class CLIApp {
                 guard let self else { return }
                 if let message = self.player.tick() { self.flash(message) }
                 if self.player.needsReconnect, Date().timeIntervalSince(self.lastReconnect) > 10 { self.reconnect() }
+                self.artwork.want(self.player.current, connection: self.connection)
                 self.nowPlaying?.update()
                 self.spinner += 1
                 self.draw()
@@ -115,6 +132,19 @@ final class CLIApp {
         }
         timer.resume()
         self.timer = timer
+
+        let rain = DispatchSource.makeTimerSource(queue: .main)
+        rain.schedule(deadline: .now() + 0.12, repeating: 0.12)
+        rain.setEventHandler { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.showingNow, self.artwork.isLoaded,
+                      self.player.isPlaying, !self.player.isWaiting else { return }
+                self.rainFrame += 1
+                self.draw()
+            }
+        }
+        rain.resume()
+        rainTimer = rain
 
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
@@ -269,6 +299,21 @@ final class CLIApp {
             handleFilter(key)
             return
         }
+        if showingNow {
+            switch key {
+            case .left, .backspace, .escape, .char("h"), .char("v"):
+                showingNow = false
+                return
+            case .tab, .char(":"), .char("P"):
+                showingNow = false  // And on to the queue, ask or playlists.
+            case .up, .down, .pageUp, .pageDown, .home, .end, .enter, .right,
+                 .char("j"), .char("k"), .char("l"), .char("g"), .char("G"), .char("/"),
+                 .char("a"), .char("s"), .char("+"), .char("="), .char("x"):
+                return  // List keys: there is no list here.
+            default:
+                break
+            }
+        }
         switch key {
         case .char("q"), .char("\u{03}"): quit()
         case .up, .char("k"): moveSelection(-1)
@@ -299,8 +344,13 @@ final class CLIApp {
             player.levelling.toggle()
             flash(player.levelling ? "Loudness levelling on." : "Loudness levelling off.")
         case .tab: toggleQueue()
+        case .char("v"):
+            guard player.current != nil else { flash("Nothing playing yet."); return }
+            showingNow = true
+            drawnArt = nil
         default: break
         }
+        artwork.want(player.current, connection: connection)
         nowPlaying?.update()
     }
 
@@ -511,10 +561,10 @@ final class CLIApp {
 
     /// `a` plays, `s` shuffles, `r` starts radio: from the selected row, or on a
     /// track list the whole list (radio seeds from the selected track). With no
-    /// row, radio seeds from what is playing.
+    /// row (or on the Now Playing screen), radio seeds from what is playing.
     private func playSelection(_ action: AskAction) {
         guard !loading else { return }
-        let selected = selectedRow
+        let selected = showingNow ? nil : selectedRow
         if let (page, _, index) = selected, page.kind == .tracks || page.kind == .queue, action != .radio {
             let tracks = page.kind == .queue ? player.tracks : page.rows.compactMap(\.item)
             if action == .shuffle {
@@ -572,12 +622,20 @@ final class CLIApp {
 
         // Header: badge, breadcrumb, server.
         let badge = "\(TTY.accentBG)\(TTY.bold) ◆ REPRISE \(TTY.reset)"
-        let crumbs = stack.map(\.title).joined(separator: " › ")
+        let crumbs = showingNow ? "Now Playing" : stack.map(\.title).joined(separator: " › ")
         let server = connection.serverName + (connection.isRelay ? " (relay)" : "")
         let crumbWidth = max(0, width - 13 - server.columns - 1)
         out += TTY.move(row: 1) + TTY.clearLine + badge + "  " + TTY.dim + crumbs.fitted(crumbWidth).padded(crumbWidth)
             + TTY.reset + " " + TTY.dim + server.fitted(max(0, width - 14)) + TTY.reset
         out += TTY.move(row: 2) + TTY.clearLine
+
+        if showingNow {
+            drawNowPlaying(&out, rows: rows, width: width)
+            drawFooter(&out, rows: rows, width: width)
+            TTY.write(out)
+            return
+        }
+        drawnArt = nil
 
         // List.
         if stack.last?.kind == .queue, stack.last?.rows.count != player.tracks.count { refreshQueuePage() }
@@ -633,16 +691,21 @@ final class CLIApp {
             let spin = ["◐", "◓", "◑", "◒"][spinner % 4]
             let icon = player.isWaiting ? spin : player.isPlaying ? "▶" : "⏸"
             let elapsed = formatTime(player.time), total = formatTime(player.duration)
-            let barWidth = max(4, width - elapsed.count - total.count - 9)
-            let fraction = player.duration > 0 ? min(1, max(0, player.time / player.duration)) : 0
-            let filled = Int(Double(barWidth) * fraction)
-            let bar = TTY.accent + String(repeating: "━", count: filled) + (filled < barWidth ? "╸" : "")
-                + TTY.reset + TTY.dim + String(repeating: "─", count: max(0, barWidth - filled - 1)) + TTY.reset
+            let bar = progressBar(width: max(4, width - elapsed.count - total.count - 9))
             out += TTY.move(row: rows - 2) + " \(TTY.accent)\(icon)\(TTY.reset) \(elapsed) \(bar) \(total)"
+        } else {
+            out += TTY.move(row: rows - 3) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
+        }
+        drawFooter(&out, rows: rows, width: width)
+        TTY.write(out)
+    }
+
+    /// The window title, and the last two lines: help, the ask or filter prompt, or a message.
+    private func drawFooter(_ out: inout String, rows: Int, width: Int) {
+        if let track = player.current {
             TTY.setTitle("\(player.isPlaying ? "♪" : "⏸") \(track.title ?? "Untitled")" + (track.grandparentTitle.map { " — \($0)" } ?? ""))
         } else {
             TTY.setTitle("Reprise")
-            out += TTY.move(row: rows - 3) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
         }
 
         // Help, filter or status.
@@ -657,11 +720,118 @@ final class CLIApp {
             out += " \(TTY.pink)\(status.fitted(width - 2))\(TTY.reset)"
         } else if loading {
             out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)\(loadingText)\(TTY.reset)"
+        } else if showingNow {
+            let help = "space pause  n/p next/prev  ,/. seek  r radio  : ask  tab queue  L levelling  ← back  q quit"
+            out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
         } else {
             let queueKeys = stack.last?.kind == .queue ? "x remove  " : ""
-            let help = "⏎ open  ← back  : ask  / filter  a play  s shuffle  r radio  +/= queue  \(queueKeys)space pause  n/p next/prev  ,/. seek  tab queue  P playlists  L levelling  q quit"
+            let help = "⏎ open  ← back  : ask  / filter  a play  s shuffle  r radio  +/= queue  \(queueKeys)space pause  n/p next/prev  ,/. seek  v now playing  tab queue  P playlists  L levelling  q quit"
             out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
         }
-        TTY.write(out)
+    }
+
+    private func progressBar(width barWidth: Int) -> String {
+        let fraction = player.duration > 0 ? min(1, max(0, player.time / player.duration)) : 0
+        let filled = Int(Double(barWidth) * fraction)
+        return TTY.accent + String(repeating: "━", count: filled) + (filled < barWidth ? "╸" : "")
+            + TTY.reset + TTY.dim + String(repeating: "─", count: max(0, barWidth - filled - 1)) + TTY.reset
+    }
+
+    // MARK: - Now Playing screen
+
+    /// The cover, large, with the track under it (or beside it in a wide, short
+    /// window). The cover is redrawn only when it, the layout or the rain's frame
+    /// changes; paused, it isn't sent again.
+    private func drawNowPlaying(_ out: inout String, rows: Int, width: Int) {
+        let top = 3
+        let available = max(0, rows - 4)  // Rows 3 to rows - 2; the footer is below.
+        let track = player.current
+        let textHeight = 6
+        let side = width >= 2 * available + 40
+        let artRows = side ? available : max(0, min(available - textHeight - 1, (width - 4) / 2))
+        let showArt = track != nil && artRows >= 4
+        let artCols = artRows * 2
+        let artCol = side ? 3 : max(1, (width - artCols) / 2 + 1)
+        let block = showArt ? (side ? artRows : artRows + 1 + textHeight) : textHeight
+        let artTop = top + max(0, (available - block) / 2)
+
+        // The rain falls only while music plays; paused, the cover holds still.
+        let frame = player.isPlaying && !player.isWaiting ? rainFrame : nil
+        let layout = "\(artwork.key ?? "-")|\(artwork.isLoaded)|\(showArt)|\(artRows)|\(artCol)|\(artTop)|\(rows)x\(width)"
+        let key = layout + "|\(frame ?? 0)"
+        if key != drawnArt {
+            // A new layout clears the screen; a new frame just writes over the cover.
+            if drawnArt?.hasPrefix(layout + "|") != true {
+                for row in top..<(rows - 1) { out += TTY.move(row: row) + TTY.clearLine }
+            }
+            drawnArt = key
+            if showArt {
+                if let lines = artwork.lines(cols: artCols, rows: artRows, frame: frame) {
+                    for (i, line) in lines.enumerated() { out += TTY.move(row: artTop + i, col: artCol) + line }
+                } else {
+                    // Not fetched yet, or no cover: a frame with a note in it.
+                    let inner = max(0, artCols - 2)
+                    for i in 0..<artRows {
+                        let line: String
+                        if i == 0 {
+                            line = "╭" + String(repeating: "─", count: inner) + "╮"
+                        } else if i == artRows - 1 {
+                            line = "╰" + String(repeating: "─", count: inner) + "╯"
+                        } else if i == artRows / 2 {
+                            let left = (inner - 1) / 2
+                            line = "│" + String(repeating: " ", count: left) + "♪" + String(repeating: " ", count: inner - left - 1) + "│"
+                        } else {
+                            line = "│" + String(repeating: " ", count: inner) + "│"
+                        }
+                        out += TTY.move(row: artTop + i, col: artCol) + TTY.dim + line + TTY.reset
+                    }
+                }
+            }
+        }
+
+        guard let track else {
+            let text = "Nothing playing"
+            out += TTY.move(row: top + available / 2, col: max(1, (width - text.columns) / 2 + 1)) + TTY.dim + text + TTY.reset
+            return
+        }
+
+        // The words: centred under the cover, or left-aligned beside it.
+        let textCol = side && showArt ? artCol + artCols + 4 : 1
+        let textWidth = side && showArt ? max(10, width - textCol - 1) : max(10, width - 4)
+        let textTop = side && showArt ? top + max(0, (available - textHeight) / 2)
+            : showArt ? artTop + artRows + 1 : artTop
+        let spin = ["◐", "◓", "◑", "◒"][spinner % 4]
+        let icon = player.isWaiting ? spin : player.isPlaying ? "▶" : "⏸"
+        let elapsed = formatTime(player.time), total = formatTime(player.duration)
+        let barSpace = side && showArt ? min(textWidth, 64) : min(textWidth, max(artCols, 44))
+        let bar = progressBar(width: max(4, barSpace - elapsed.count - total.count - 4))
+        let upcoming = player.index.flatMap { $0 + 1 < player.tracks.count ? player.tracks[$0 + 1] : nil }
+        let sub = [track.grandparentTitle, track.parentTitle].compactMap { $0 }.joined(separator: " · ")
+        // (styled text, its width in columns)
+        func plain(_ text: String, _ style: String) -> (String, Int) {
+            let fit = text.fitted(textWidth)
+            return (style + fit + TTY.reset, fit.columns)
+        }
+        let progressPlain = 2 + elapsed.count + 1 + max(4, barSpace - elapsed.count - total.count - 4) + 1 + total.count
+        let lines: [(String, Int)] = [
+            plain(track.title ?? "Untitled", TTY.bold),
+            plain(sub, TTY.dim),
+            ("", 0),
+            ("\(TTY.accent)\(icon)\(TTY.reset) \(elapsed) \(bar) \(total)", progressPlain),
+            plain(player.quality(of: track), TTY.dim),
+            upcoming.map { next in
+                plain("Next: " + (next.title ?? "Untitled") + (next.grandparentTitle.map { " · \($0)" } ?? ""), TTY.dim)
+            } ?? ("", 0)
+        ]
+        for (i, line) in lines.enumerated() {
+            let row = textTop + i
+            guard row < rows - 1 else { break }
+            if side && showArt {
+                out += TTY.move(row: row, col: textCol) + "\u{1B}[K" + line.0
+            } else {
+                out += TTY.move(row: row) + TTY.clearLine
+                    + TTY.move(row: row, col: max(1, (width - line.1) / 2 + 1)) + line.0
+            }
+        }
     }
 }

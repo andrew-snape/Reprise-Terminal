@@ -64,6 +64,10 @@ final class CLIPlayer {
     private var restoredAt: Double?
     /// The track a refused file was retried for; a second refusal skips it.
     private var refusedRetry: Int?
+    /// A refused track is held, with nothing in AVPlayer, until it is loaded again.
+    private var retrying = false
+    /// Bumped by every `load`; a retry scheduled before one is dropped.
+    private var generation = 0
 
     /// Loudness levelling (Plex's gain analysis), on unless turned off.
     var levelling = true { didSet { applyVolume() } }
@@ -88,8 +92,8 @@ final class CLIPlayer {
     }
 
     var current: PlexMetadata? { index.map { tracks[$0] } }
-    var isPlaying: Bool { player.timeControlStatus != .paused || playAfterSeek }
-    var isWaiting: Bool { needsReconnect || player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
+    var isPlaying: Bool { player.timeControlStatus != .paused || playAfterSeek || retrying }
+    var isWaiting: Bool { needsReconnect || retrying || player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
     var time: Double { restoredAt ?? pendingSeek ?? player.currentTime().seconds }
     var duration: Double {
         if restoredAt == nil, let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { return d }
@@ -143,6 +147,19 @@ final class CLIPlayer {
 
     func next() {
         guard let index, index + 1 < tracks.count else { return }
+        // The next track is already queued, its file already open: move onto it.
+        // Loading it afresh would ask Plex for a file this session is still
+        // reading, which it refuses for a moment.
+        if restoredAt == nil, let playing = followed, playing.item === player.currentItem,
+           let upcoming = entries.first(where: { $0.index == index + 1 && $0.item.status != .failed }) {
+            player.volume = volume(for: tracks[upcoming.index])
+            forget(playing)  // Left, not played out: no scrobble.
+            player.advanceToNextItem()
+            followed = nil   // `tick` takes it from here without counting a play.
+            self.index = upcoming.index
+            player.play()
+            return
+        }
         restoredAt = nil
         load(from: index + 1)
         player.play()
@@ -239,15 +256,9 @@ final class CLIPlayer {
             saveState()
             return
         }
-        // Items go in after the one before `at`, which is always in AVPlayer's queue.
-        var after = entries.first { $0.index == at - 1 }?.item
-        for i in at..<(at + list.count) {
-            guard let (url, transcode) = source(for: tracks[i]) else { continue }
-            let item = makeItem(url)
-            entries.append(Entry(item: item, index: i, transcode: transcode))
-            player.insert(item, after: after)
-            after = item
-        }
+        // Playing next replaces the queued follow-on; anything later is queued in its turn.
+        if next { dropQueued() }
+        topUp()
         saveState()
     }
 
@@ -276,6 +287,7 @@ final class CLIPlayer {
             }
             tracks.remove(at: i)
             shift(from: i + 1, by: -1)
+            topUp()
         }
         saveState()
     }
@@ -295,12 +307,18 @@ final class CLIPlayer {
     /// Returns a message when a track could not be played.
     func tick() -> String? {
         var message: String?
-        if !needsReconnect, let item = player.currentItem, item.status == .failed {
+        if !needsReconnect, !retrying, let item = player.currentItem, item.status == .failed {
             let entry = entry(for: item)
             let title = entry.map { tracks[$0.index].title ?? "A track" } ?? "A track"
             if let error = item.error, CLISignIn.isNetworkError(error), retriedIndex != entry?.index,
                entry?.isLocal != true {
-                // The server went away, not the file: hold here and reconnect.
+                if let entry, refusedRetry != entry.index {
+                    // Usually not the network: Plex refuses a file for a moment while an
+                    // earlier read of it on this session closes (-1008). One quiet retry.
+                    holdAndRetry(entry.index, at: player.currentTime().seconds)
+                    return nil
+                }
+                // Refused twice: the server went away, not the file. Hold here and reconnect.
                 needsReconnect = true
                 return "Lost \(connection.serverName). Reconnecting…"
             }
@@ -332,28 +350,23 @@ final class CLIPlayer {
                 // AVQueuePlayer skipped a failed item on its own: it didn't play out.
                 // Plex refuses a file for a moment while an earlier read of it on
                 // this session closes, so it gets one retry before it is skipped.
-                forget(old)
-                followed = now
-                index = now?.index
                 if refusedRetry != old.index {
-                    refusedRetry = old.index
-                    let wanted = old.index
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                        MainActor.assumeIsolated {
-                            guard let self, self.index == wanted + 1 || self.index == nil,
-                                  self.tracks.indices.contains(wanted) else { return }
-                            self.load(from: wanted)
-                            self.player.play()
-                        }
-                    }
+                    holdAndRetry(old.index, at: 0)
                     return message
                 }
+                forget(old)
                 refusedRetry = nil
                 message = "\(tracks[old.index].title ?? "A track") wouldn't play, skipped."
             } else if let old = followed {
                 // AVPlayer moved on by itself: the previous track played out.
                 scrobble(tracks[old.index])
                 forget(old)
+                if now == nil, old.index + 1 < tracks.count {
+                    // Its follow-on wasn't queued (or was dropped): load it now.
+                    load(from: old.index + 1)
+                    player.play()
+                    return message
+                }
                 if now == nil {
                     let track = tracks[old.index]
                     Task { await report(track, time: 0, state: "stopped") }
@@ -371,7 +384,10 @@ final class CLIPlayer {
                 download = nil
             }
             applyVolume()
-            if now != nil { saveState() }
+            if now != nil {
+                topUp()
+                saveState()
+            }
         }
         if let index {
             fetchDetails(tracks[index])
@@ -460,7 +476,12 @@ final class CLIPlayer {
 
     // MARK: - Loading
 
+    /// Plays from `start`: the track and the one after it go into AVPlayer, the
+    /// rest are queued in turn as each starts (as Reprise for Mac does). With the
+    /// whole list in AVPlayer, one refused file made it run on through the rest.
     private func load(from start: Int) {
+        generation += 1
+        retrying = false
         restoredAt = nil
         // The old queue is left. AVPlayer only reads the current item and the next,
         // so only those two can have a transcoder running.
@@ -483,10 +504,64 @@ final class CLIPlayer {
             let item = makeItem(url)
             entries.append(Entry(item: item, index: i, transcode: transcode))
             player.insert(item, after: nil)
+            break
         }
         followed = player.currentItem.flatMap { entry(for: $0) }
         index = followed?.index
         applyVolume()
+        topUp()
+    }
+
+    /// Queues the track after the current one, if it isn't queued already.
+    private func topUp() {
+        guard restoredAt == nil, let current = followed, current.item === player.currentItem,
+              !entries.contains(where: { $0.index > current.index }) else { return }
+        for i in (current.index + 1)..<max(current.index + 1, tracks.count) {
+            guard let (url, transcode) = source(for: tracks[i]) else { continue }
+            let item = makeItem(url)
+            entries.append(Entry(item: item, index: i, transcode: transcode))
+            player.insert(item, after: current.item)
+            return
+        }
+    }
+
+    /// Takes the queued follow-on out, so a different track can follow.
+    private func dropQueued() {
+        guard let current = followed else { return }
+        for entry in entries where entry.index > current.index && entry.item !== current.item {
+            player.remove(entry.item)
+            forget(entry)
+        }
+    }
+
+    /// Holds a refused track with nothing in AVPlayer (so it can't run on to the
+    /// next) and loads it again a second later, once. A load in between cancels it.
+    private func holdAndRetry(_ wanted: Int, at seconds: Double) {
+        refusedRetry = wanted
+        let left = entries
+        player.removeAllItems()
+        for entry in left.prefix(2) { Task { await stopTranscode(entry) } }
+        for file in left.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
+        entries = []
+        followed = nil
+        index = wanted
+        download?.task.cancel()
+        download = nil
+        retrying = true
+        let generation = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.generation == generation, self.retrying,
+                      self.tracks.indices.contains(wanted) else { return }
+                self.load(from: wanted)
+                if seconds.isFinite, seconds > 1 {
+                    self.pendingSeek = seconds
+                    self.playAfterSeek = true
+                } else {
+                    self.player.play()
+                }
+            }
+        }
     }
 
     private func makeItem(_ url: URL) -> AVPlayerItem {
