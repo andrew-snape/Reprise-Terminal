@@ -41,6 +41,15 @@ enum RepriseCLI {
             return
         }
         let chooseServer = arguments.contains("--server")
+        // Hidden: `--ask "<request>"` prints how a request is read and what it finds.
+        if let i = arguments.firstIndex(of: "--ask") {
+            let text = arguments[(i + 1)...].joined(separator: " ")
+            Task {
+                await ask(text, chooseServer: chooseServer)
+                exit(0)
+            }
+            dispatchMain()
+        }
 
         Task {
             do {
@@ -57,7 +66,36 @@ enum RepriseCLI {
                 exit(1)
             }
         }
-        dispatchMain()
+        // The main run loop, not dispatchMain(): Now Playing and the media keys need it.
+        RunLoop.main.run()
+    }
+}
+
+extension RepriseCLI {
+    /// Titles only, never URLs.
+    static func ask(_ text: String, chooseServer: Bool) async {
+        do {
+            let connection = try await CLISignIn.connect(chooseServer: chooseServer)
+            let libraries = try await PlexNetworkManager.shared.getLibraries(
+                serverURL: connection.serverURL, authToken: connection.token).filter { $0.type == "artist" }
+            guard let library = libraries.first else { print("No music library."); return }
+            print("Apple Intelligence:", CLIAsk.isAvailable ? "on" : "off")
+            let start = Date()
+            let session = await CLIAsk.session(connection: connection, section: library.key)
+            let result = try await CLIAsk.run(text, session: session, connection: connection, section: library.key)
+            if let request = CLIAsk.lastRequest { print("Read as:", request) }
+            print(String(format: "%.1f s", Date().timeIntervalSince(start)))
+            print(result.label, "·", result.action)
+            for t in result.tracks.prefix(10) {
+                print("  ♪", t.title ?? "?", "—", t.grandparentTitle ?? "", "·", t.parentTitle ?? "")
+            }
+            if result.tracks.count > 10 { print("  … \(result.tracks.count) tracks") }
+            for c in result.choices.prefix(12) {
+                print("  ?", c.type ?? "", c.title ?? "?", "—", c.parentTitle ?? c.grandparentTitle ?? "")
+            }
+        } catch {
+            print("reprise: \(SensitiveDataRedactor.redact(error.localizedDescription))")
+        }
     }
 }
 

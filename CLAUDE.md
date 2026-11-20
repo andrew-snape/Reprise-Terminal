@@ -9,13 +9,14 @@ foreground, stopping when the window closes.
 ## Quick reference
 
 - **Build**: `swift build -c release` → `.build/release/reprise`; `scripts/install.sh` also
-  links `~/.local/bin/reprise`. About 25 s for a release build, a ~1.2 MB binary.
+  links `~/.local/bin/reprise`. About 25 s for a release build, a ~2.1 MB binary.
 - **Language**: Swift 6 language mode, default actor isolation `MainActor`, approachable
   concurrency (`NonisolatedNonsendingByDefault`, `InferIsolatedConformances`) and
   `MemberImportVisibility`: the same settings as the Mac app, so the vendored core compiles as is.
 - **One module**: `Package.swift` has a single executable target holding the CLI files *and*
   `RivuletCore`, because RivuletCore's types are internal.
-- **No dependencies.** AVFoundation plays; Foundation Models (planned) is a system framework.
+- **No dependencies.** AVFoundation plays; Foundation Models (ask), MediaPlayer (Now Playing)
+  and Network (path changes) are system frameworks.
 - **Repo is private** for now. Keep commit messages short and plain.
 
 ## Layout
@@ -24,8 +25,12 @@ foreground, stopping when the window closes.
 Sources/reprise/
 ├── RepriseCLI.swift    # @main: flags, PlexAPI identity, keeps CLIApp alive, dispatchMain()
 ├── CLISignIn.swift     # CLIConfig (token file), PIN sign-in, server choice, connection ranking
-├── CLIApp.swift        # pages (libraries → artists → albums → tracks, queue), keys, drawing
-├── CLIPlayer.swift     # AVQueuePlayer, direct/transcode URLs, quality text, Plex reporting
+├── CLIApp.swift        # pages (libraries → artists → albums → tracks, playlists, queue,
+│                       #   ask results), keys, drawing, reconnects
+├── CLIAsk.swift        # "ask": Foundation Models reads a request, Plex finds the music
+├── CLINowPlaying.swift # Control Centre Now Playing and media keys
+├── CLIPlayer.swift     # AVQueuePlayer, direct/transcode URLs, queue editing, levelling,
+│                       #   slow-start download, saved queue, quality text, Plex reporting
 ├── TTY.swift           # raw mode, alternate screen, signals, key decoding, ANSI styles
 └── RivuletCore/        # vendored from Reprise-Mac (see below); not edited here
 ```
@@ -83,6 +88,28 @@ Sources/reprise/
 - **Window title** is the playing track (OSC 2). The old title is pushed on enter
   (`CSI 22;0t`) and popped on restore (`CSI 23;0t`), after an empty title for terminals
   without a title stack.
+- **The main run loop runs** (`RunLoop.main.run()`, not `dispatchMain()`): MediaPlayer's
+  remote commands need it. The main dispatch queue is still drained by it.
+- **Ask** (`:`, `CLIAsk`): a fresh `LanguageModelSession` per request, made and prewarmed
+  when the prompt opens, greedy sampling. The model only fills `PlayRequest`; names it
+  returns are kept only if every word was typed (`grounded`), since the small model adds
+  names it knows ("Queen") and placeholders ("No artist specified"). Named requests go
+  through `/hubs/search` (fuzzy: "saviours" finds "Saviors") plus the artist's own
+  albums, then a local fuzzy rank; a weak or close match opens a results page, never a
+  guess. Descriptive ones become `getRandomTracks` filters: genre and mood ids from the
+  library's `?type=10` lists, years as `album.year>>=` / `album.year<<=` (plain `year`
+  matches nothing for tracks; verified Nov 2026). Moods are dropped first, then years,
+  when nothing matches. Without Apple Intelligence it is a keyword search. Try requests
+  with the hidden `reprise --ask "<text>"`.
+- **Saved queue**: `reprise-cli/queue.json` (rating keys, index, time, server id), written
+  on track change, pause, queue edits and quit, deleted when the queue plays out; on launch
+  it comes back paused (batched `/library/metadata/k1,k2,…`).
+- **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into
+  `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting (cleared on
+  launch and quit). Never on relay or for a transcode.
+- **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
+  metadata (album gain when one album plays in order), set on the player when a track starts
+  (the next item's on `didPlayToEndTime`, so no loud first moment).
 - **Never print or log URLs.** File and transcode URLs carry the token. Error text goes
   through `SensitiveDataRedactor.redact`.
 
@@ -101,32 +128,18 @@ IPTV, watchlist) is unused here; it compiles, and the binary stays small.
 
 ## Known issues and next steps
 
-The plan is in `PLAN.md`: natural-language "ask" with Apple Intelligence first, then the
-slow start on big lossless files, then smaller features.
-
-- **Slow start on big lossless files.** An ALAC 24/96 track takes 20 to 30 s to start.
-  AVPlayer's own progressive stream of a large file sits waiting. Reprise for Mac fixed the
-  same thing (commit `10cd8077`, `MacMusicPlayback.playCurrentFromFile`,
-  `MacMusicPrecache`): while the track waits, download the whole file (through
-  `PlexCertificateDelegate.session`, no URL cache) and reload from the `file://` copy at
-  the same position. Skip on relay. Also try `automaticallyWaitsToMinimizeStalling = false`.
-- **Plex facts for natural-language requests**, measured on the owner's server (PMS, music
-  section key 1, Nov 2026):
-  - `/library/sections/{key}/genre` returns 19 genres, `/mood` 279 moods and `/style`
-    266 styles. Each entry is `{key, title}`, and the keys differ per library.
-  - `?type=10` narrows the lists to tracks' own tags: 14 genres and 270 moods.
-  - Not yet verified: the track filter syntax (`type=10&genre=<id>`, `mood=<id>`), and
-    whether years need `album.year`.
-  - Filter operators: `>>=` means "greater than" and `<<=` "less than", sent pre-encoded.
-  - `X-Plex-Container-Size` is ignored unless `X-Plex-Container-Start` is sent with it.
-  - Helpers already in RivuletCore: `getRandomTracks(filters:)`, `getPopularTracks`,
-    `getSonicallySimilarTracks` (`/nearest`), `getAudioPlaylists`, `search`.
-  - The Mac's model for it: `RivuletMac/Intelligence/MacSmartSearch.swift`.
+See `PLAN.md`. Unverified so far (needs a real terminal and ears): Now Playing and media keys
+from a bare CLI process, the slow-start swap on a real 24/96 file, levelling.
 
 ## Testing
 
 There are no automated tests. Build, then run `reprise` in a real terminal: it needs a TTY
-and a Plex sign-in, so it cannot be exercised from a non-interactive shell beyond `--help`.
+and a Plex sign-in. From a non-interactive shell:
+
+- `reprise --ask "<request>"` signs in from the saved config and prints how the request was
+  read and what it found (titles only).
+- A Python `pty.fork()` driver can start the app, send keys and read the frames (each draw
+  starts with `ESC [?25l`); avoid keys that start playback unless sound is wanted.
 
 `TTY.swift` imports only Foundation, so the key decoder and column widths can be checked
 alone: `swiftc -swift-version 5 Sources/reprise/TTY.swift main.swift`, with a `main.swift`

@@ -3,19 +3,20 @@
 //  CLIApp.swift
 //  reprise (terminal)
 //
-//  The full-screen browser: libraries → artists → albums → tracks, a queue
-//  page, and the now-playing bar. Everything runs on the main actor; the
-//  screen is redrawn whole after every key and twice a second. When the
-//  network changes or the server stops answering, the server is probed again
-//  and playback moves to the new address.
+//  The full-screen browser: libraries → artists → albums → tracks, playlists,
+//  a queue page, "ask" results, and the now-playing bar. Everything runs on
+//  the main actor; the screen is redrawn whole after every key and twice a
+//  second. When the network changes or the server stops answering, the
+//  server is probed again and playback moves to the new address.
 //
 
 import Foundation
+import FoundationModels
 import Network
 
 final class CLIApp {
     private enum Kind {
-        case libraries, artists, albums, tracks, queue
+        case libraries, artists, albums, tracks, queue, playlists, results
     }
 
     private struct Row {
@@ -32,6 +33,8 @@ final class CLIApp {
         var selected = 0
         var top = 0
         var filter = ""
+        /// What `a` does on a results page: how the request was read.
+        var action: AskAction = .play
 
         /// Indices into `rows` that match the filter.
         var visible: [Int] {
@@ -56,6 +59,13 @@ final class CLIApp {
     private var pathChange: DispatchWorkItem?
     private var reconnecting = false
     private var lastReconnect = Date.distantPast
+    private var loadingText = "Loading…"
+    /// The music library being browsed (or the first), for ask, radio and filters.
+    private var library: PlexLibrary?
+    private var asking = false
+    private var askText = ""
+    private var askSession: LanguageModelSession?
+    private var nowPlaying: CLINowPlaying?
 
     /// The player owns the connection, so a reconnect changes it in one place.
     private var connection: CLIConnection { player.connection }
@@ -67,6 +77,8 @@ final class CLIApp {
     // MARK: - Run
 
     func run() async {
+        CLIPlayer.clearCache()
+        nowPlaying = CLINowPlaying(player: player, onChange: { [weak self] in self?.draw() })
         TTY.enter(onResize: { [weak self] in self?.draw() },
                   onQuit: { [weak self] in self?.quit() })
         draw()
@@ -91,6 +103,7 @@ final class CLIApp {
                 guard let self else { return }
                 if let message = self.player.tick() { self.flash(message) }
                 if self.player.needsReconnect, Date().timeIntervalSince(self.lastReconnect) > 10 { self.reconnect() }
+                self.nowPlaying?.update()
                 self.spinner += 1
                 self.draw()
             }
@@ -108,6 +121,15 @@ final class CLIApp {
         await loadLibraries()
     }
 
+    /// The queue from last time, paused where it stopped.
+    private func resumeQueue() {
+        Task {
+            guard let saved = await CLIPlayer.savedQueue(connection: connection), player.current == nil else { return }
+            player.restore(saved.tracks, index: saved.index, at: saved.time)
+            flash("Picked up where you left off. Space plays.")
+        }
+    }
+
     private func quit() {
         guard !quitting else { return }
         quitting = true
@@ -119,6 +141,7 @@ final class CLIApp {
                 await group.next()
                 group.cancelAll()
             }
+            CLIPlayer.clearCache()
             TTY.restore()
             exit(0)
         }
@@ -162,7 +185,8 @@ final class CLIApp {
 
     // MARK: - Loading
 
-    private func load(_ work: @escaping () async throws -> Void) {
+    private func load(_ text: String = "Loading…", _ work: @escaping () async throws -> Void) {
+        loadingText = text
         loading = true
         draw()
         Task {
@@ -181,6 +205,8 @@ final class CLIApp {
         load { [self] in
             let libraries = try await network.getLibraries(serverURL: connection.serverURL, authToken: connection.token)
                 .filter { $0.type == "artist" }
+            library = libraries.first
+            resumeQueue()
             if libraries.count == 1 {
                 try await openLibrary(libraries[0])
             } else if libraries.isEmpty {
@@ -193,6 +219,7 @@ final class CLIApp {
     }
 
     private func openLibrary(_ library: PlexLibrary) async throws {
+        self.library = library
         var artists: [PlexMetadata] = []
         let size = 500
         while true {
@@ -228,6 +255,10 @@ final class CLIApp {
     // MARK: - Keys
 
     private func handle(_ key: Key) {
+        if asking {
+            handleAsk(key)
+            return
+        }
         if filtering {
             handleFilter(key)
             return
@@ -250,11 +281,130 @@ final class CLIApp {
         case .char("p"), .char("<"): player.previous()
         case .char("."), .char("]"): player.seek(by: 10)
         case .char(","), .char("["): player.seek(by: -10)
-        case .char("s"): playSelection(shuffled: true)
-        case .char("a"): playSelection(shuffled: false)
+        case .char("s"): playSelection(.shuffle)
+        case .char("a"): playSelection(.play)
+        case .char("r"): playSelection(.radio)
+        case .char("+"): enqueueSelection(next: true)
+        case .char("="): enqueueSelection(next: false)
+        case .char("x"): removeFromQueue()
+        case .char(":"): startAsk()
+        case .char("P"): openPlaylists()
+        case .char("L"):
+            player.levelling.toggle()
+            flash(player.levelling ? "Loudness levelling on." : "Loudness levelling off.")
         case .tab: toggleQueue()
         default: break
         }
+        nowPlaying?.update()
+    }
+
+    // MARK: - Ask
+
+    private func startAsk() {
+        guard let library else { flash("No music library to ask."); return }
+        asking = true
+        askText = ""
+        askSession = nil
+        // Made and warmed up while the request is typed.
+        let connection = connection
+        Task { askSession = await CLIAsk.session(connection: connection, section: library.key) }
+    }
+
+    private func handleAsk(_ key: Key) {
+        switch key {
+        case .escape:
+            asking = false
+        case .enter:
+            asking = false
+            let text = askText.trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty { runAsk(text) }
+        case .backspace:
+            if askText.isEmpty { asking = false } else { askText.removeLast() }
+        case .char("\u{03}"): quit()
+        case .char(let c):
+            askText.append(c)
+        default:
+            break
+        }
+    }
+
+    private func runAsk(_ text: String) {
+        guard let library else { return }
+        let session = askSession
+        askSession = nil
+        load(CLIAsk.isAvailable ? "Thinking…" : "Searching…") { [self] in
+            let result = try await CLIAsk.run(text, session: session, connection: connection, section: library.key)
+            if !result.tracks.isEmpty {
+                act(on: result.tracks, action: result.action, label: result.label)
+            } else if !result.choices.isEmpty {
+                var page = Page(kind: .results, title: result.label, rows: result.choices.map(resultRow))
+                page.action = result.action
+                push(page)
+            } else {
+                flash("Nothing found for “\(text)”.")
+            }
+        }
+    }
+
+    private func resultRow(_ item: PlexMetadata) -> Row {
+        let by = item.type == "album" ? item.parentTitle : item.type == "track" ? item.grandparentTitle : nil
+        let kind = ["artist": "artist", "album": "album", "track": "song", "playlist": "playlist"][item.type ?? ""] ?? ""
+        return Row(title: (item.title ?? "Untitled") + (by.map { " · \($0)" } ?? ""), detail: kind, item: item)
+    }
+
+    /// Plays or queues what was found, and says what it was.
+    private func act(on tracks: [PlexMetadata], action: AskAction, label: String) {
+        switch action {
+        case .queue:
+            player.enqueue(tracks, next: false)
+            flash("Queued · \(label.replacingOccurrences(of: "Queue · ", with: "")) (\(tracks.count))")
+        case .play, .shuffle, .radio:
+            player.play(tracks, from: 0)
+            flash("▶ \(label)")
+        }
+    }
+
+    // MARK: - Playlists, radio, queue
+
+    private func openPlaylists() {
+        guard !loading else { return }
+        if stack.last?.kind == .playlists { return }
+        load { [self] in
+            let playlists = try await network.getAudioPlaylists(serverURL: connection.serverURL, authToken: connection.token)
+            push(Page(kind: .playlists, title: "Playlists", rows: playlists.map {
+                Row(title: $0.title ?? "Untitled", detail: $0.leafCount.map { "\($0) songs" } ?? "", item: $0)
+            }))
+        }
+    }
+
+    /// The music a row stands for: an artist's, album's or playlist's tracks, or the track itself.
+    private func tracks(for item: PlexMetadata, action: AskAction) async throws -> [PlexMetadata] {
+        try await CLIAsk.tracks(of: item, action: action, connection: connection, section: library?.key ?? "")
+    }
+
+    private func enqueueSelection(next: Bool) {
+        guard !loading, let (_, row, _) = selectedRow, let item = row.item else { return }
+        load { [self] in
+            let tracks = try await tracks(for: item, action: .queue)
+            guard !tracks.isEmpty else { return }
+            let wasEmpty = player.current == nil
+            player.enqueue(tracks, next: next)
+            let what = tracks.count == 1 ? "“\(tracks[0].title ?? "Untitled")”" : "\(tracks.count) songs"
+            flash(wasEmpty ? "Playing \(what)." : next ? "Up next: \(what)." : "Added \(what) to the end.")
+        }
+    }
+
+    private func removeFromQueue() {
+        guard stack.last?.kind == .queue, let (_, _, index) = selectedRow else { return }
+        player.remove(at: index)
+        refreshQueuePage()
+        if player.tracks.isEmpty { stack.removeLast() }
+    }
+
+    private func refreshQueuePage() {
+        guard let page = stack.last, page.kind == .queue else { return }
+        stack[stack.count - 1].rows = trackRows(player.tracks, numbered: false)
+        if page.selected >= player.tracks.count { stack[stack.count - 1].selected = max(0, player.tracks.count - 1) }
     }
 
     private func handleFilter(_ key: Key) {
@@ -326,24 +476,55 @@ final class CLIApp {
             player.play(page.rows.compactMap(\.item), from: index)
         case .queue:
             player.play(player.tracks, from: index)
+        case .playlists:
+            guard let playlist = row.item else { return }
+            load { [self] in
+                let tracks = try await tracks(for: playlist, action: .play)
+                push(Page(kind: .tracks, title: playlist.title ?? "Playlist", rows: trackRows(tracks, numbered: false)))
+            }
+        case .results:
+            guard let item = row.item else { return }
+            switch item.type {
+            case "artist":
+                load { [self] in
+                    let albums = try await children(of: item)
+                    push(Page(kind: .albums, title: item.title ?? "Artist", rows: albums.map {
+                        Row(title: $0.title ?? "Untitled", detail: $0.year.map(String.init) ?? "", item: $0)
+                    }))
+                }
+            case "album", "playlist":
+                load { [self] in
+                    let tracks = try await tracks(for: item, action: .play)
+                    push(Page(kind: .tracks, title: item.title ?? "Album", rows: trackRows(tracks, numbered: item.type == "album")))
+                }
+            default:
+                playSelection(page.action)
+            }
         }
     }
 
-    /// `a` plays, `s` shuffles: the selected album, or the track list showing.
-    private func playSelection(shuffled: Bool) {
-        guard !loading, let (page, row, _) = selectedRow else { return }
-        switch page.kind {
-        case .albums:
-            guard let album = row.item else { return }
-            load { [self] in
-                let tracks = try await children(of: album)
-                player.play(shuffled ? tracks.shuffled() : tracks, from: 0)
+    /// `a` plays, `s` shuffles, `r` starts radio: from the selected row, or on a
+    /// track list the whole list (radio seeds from the selected track). With no
+    /// row, radio seeds from what is playing.
+    private func playSelection(_ action: AskAction) {
+        guard !loading else { return }
+        let selected = selectedRow
+        if let (page, _, index) = selected, page.kind == .tracks || page.kind == .queue, action != .radio {
+            let tracks = page.kind == .queue ? player.tracks : page.rows.compactMap(\.item)
+            if action == .shuffle {
+                player.play(tracks.shuffled(), from: 0)
+            } else {
+                player.play(tracks, from: page.kind == .queue ? index : 0)
             }
-        case .tracks:
-            let tracks = page.rows.compactMap(\.item)
-            player.play(shuffled ? tracks.shuffled() : tracks, from: 0)
-        default:
-            break
+            return
+        }
+        guard let item = selected?.row.item ?? (action == .radio ? player.current : nil) else { return }
+        load(action == .radio ? "Tuning in…" : "Loading…") { [self] in
+            var result = AskResult(label: CLIAsk.label(for: item), action: action)
+            result.tracks = try await tracks(for: item, action: action)
+            result = try await CLIAsk.finish(result, connection: connection)
+            guard !result.tracks.isEmpty else { flash("Nothing to play there."); return }
+            act(on: result.tracks, action: action, label: result.label)
         }
     }
 
@@ -393,6 +574,7 @@ final class CLIApp {
         out += TTY.move(row: 2) + TTY.clearLine
 
         // List.
+        if stack.last?.kind == .queue, stack.last?.rows.count != player.tracks.count { refreshQueuePage() }
         let height = max(1, rows - 7)
         if var page = stack.last {
             let visible = page.visible
@@ -460,14 +642,18 @@ final class CLIApp {
         // Help, filter or status.
         out += TTY.move(row: rows - 1) + TTY.clearLine
         out += TTY.move(row: rows) + TTY.clearLine
-        if filtering, let page = stack.last {
+        if asking {
+            let name = CLIAsk.isAvailable ? "ask" : "search"
+            out += " \(TTY.accent)✦ \(name) ›\(TTY.reset) \(askText.fitted(max(1, width - 30)))\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ go  esc cancel\(TTY.reset)"
+        } else if filtering, let page = stack.last {
             out += " \(TTY.accent)/\(TTY.reset) \(page.filter.fitted(max(1, width - 20)))\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ open  esc clear\(TTY.reset)"
         } else if let status, Date() < statusUntil {
             out += " \(TTY.pink)\(status.fitted(width - 2))\(TTY.reset)"
         } else if loading {
-            out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)Loading…\(TTY.reset)"
+            out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)\(loadingText)\(TTY.reset)"
         } else {
-            let help = "⏎ open  ← back  / filter  a play  s shuffle  space pause  n/p next/prev  ,/. seek  tab queue  q quit"
+            let queueKeys = stack.last?.kind == .queue ? "x remove  " : ""
+            let help = "⏎ open  ← back  : ask  / filter  a play  s shuffle  r radio  +/= queue  \(queueKeys)space pause  n/p next/prev  ,/. seek  tab queue  P playlists  L levelling  q quit"
             out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
         }
         TTY.write(out)
