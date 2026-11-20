@@ -99,10 +99,16 @@ Sources/reprise/
   (`CSI 22;0t`) and popped on restore (`CSI 23;0t`), after an empty title for terminals
   without a title stack.
 - **Terminal modes**: each frame is wrapped in synchronized output (`CSI ?2026h/l`,
-  `TTY.frame`). Focus reporting (`?1004`) stops the rain while the window is in the
-  background. Bracketed paste (`?2004`) arrives as one `.paste` key, even across reads, and
+  `TTY.frame`). Focus reporting (`?1004`) only re-asks the background colour on focus
+  in; it must not stop the rain (an unfocused window is often still in view). Bracketed paste (`?2004`) arrives as one `.paste` key, even across reads, and
   goes only into the ask and filter prompts as one line, so pasted text never runs commands.
   Both modes are switched off in `restore`. Terminals without them ignore them.
+- **Light backgrounds**: the background colour is asked with OSC 11 on launch and on
+  focus in (Terminal.app answers, e.g. Basic `rgb:ffff/ffff/ffff`); the decoder swallows
+  every OSC reply (BEL or ST, across reads) so it never becomes keys (`]` seeks, `r` radio).
+  Dark until it answers. On light, `TTY.accent` and `pink` are deeper, and the cover keeps
+  its shape but each glyph's colour is darkened to a luminance that reads on white
+  (`CLIArtwork.ink`), with the rain as ink, not light.
 - **The main run loop runs** (`RunLoop.main.run()`, not `dispatchMain()`): MediaPlayer's
   remote commands need it. The main dispatch queue is still drained by it.
 - **Ask** (`:`, `CLIAsk`): a fresh `LanguageModelSession` per request, made and prewarmed

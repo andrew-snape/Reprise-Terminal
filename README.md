@@ -13,6 +13,12 @@ and shares its Plex code.
 
 ![Browsing the library, with the now-playing bar](docs/browse.png)
 
+It reads the terminal's background and adjusts for light themes such as Terminal's Basic profile:
+
+![Now Playing on a light background](docs/now-playing-light.png)
+
+![Browsing on a light background](docs/browse-light.png)
+
 ## Requirements
 
 - An Apple silicon Mac running macOS 27 or later

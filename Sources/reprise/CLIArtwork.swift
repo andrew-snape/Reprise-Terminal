@@ -110,7 +110,9 @@ final class CLIArtwork {
                     character = Self.glyphs[Int((seed &+ flicker) % UInt64(Self.glyphs.count))]
                 }
                 if character != " " {
-                    let colour = Self.shade(colours[y * cols + x], level: level, whiten: head ? 0.8 : glow * 1.2)
+                    let colour = TTY.light
+                        ? Self.ink(colours[y * cols + x], level: level, darken: head ? 0.6 : glow)
+                        : Self.shade(colours[y * cols + x], level: level, whiten: head ? 0.8 : glow * 1.2)
                     if lastColour.map({ $0 != colour }) ?? true {
                         line += "\u{1B}[38;2;\(colour.0);\(colour.1);\(colour.2)m"
                         lastColour = colour
@@ -135,6 +137,25 @@ final class CLIArtwork {
             return min(255, Int(mixed) / 8 * 8 + 4)
         }
         return (channel(colour.r), channel(colour.g), channel(colour.b))
+    }
+
+    /// On a light background: the cell's own hue, darkened until it reads on white
+    /// (brighter cells darker, so the cover's shape stays as on a dark screen), then
+    /// toward black by `darken` (the rain is ink here, not light).
+    private static func ink(_ colour: RGB, level: Float, darken: Double) -> (Int, Int, Int) {
+        func linear(_ v: Double) -> Double { pow(v / 255, 2.2) }
+        let channels = [linear(colour.r), linear(colour.g), linear(colour.b)]
+        let luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+        let target = 0.32 - 0.24 * Double(level)  // 3:1 against white at the faintest.
+        let scale = luminance > target ? target / luminance : 1
+        let grey = min(luminance, target)
+        func channel(_ v: Double) -> Int {
+            // Darkened colours go muddy: a little more saturation keeps the hue.
+            let saturated = min(1, max(0, grey + (v * scale - grey) * 1.4))
+            let value = 255 * pow(saturated, 1 / 2.2) * (1 - min(1, darken))
+            return min(255, Int(value) / 8 * 8 + 4)
+        }
+        return (channel(channels[0]), channel(channels[1]), channel(channels[2]))
     }
 
     /// The cover drawn at one pixel a cell (a cell is twice as tall as wide, so a

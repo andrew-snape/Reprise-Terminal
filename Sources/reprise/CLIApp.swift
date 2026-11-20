@@ -76,8 +76,6 @@ final class CLIApp {
     /// The Matrix rain's step, advanced while the Now Playing screen shows music playing.
     private var rainFrame = 1
     private var rainTimer: DispatchSourceTimer?
-    /// False while the window is in the background (focus reporting); the rain then stops.
-    private var focused = true
 
     /// The player owns the connection, so a reconnect changes it in one place.
     private var connection: CLIConnection { player.connection }
@@ -100,6 +98,7 @@ final class CLIApp {
                       self?.draw()
                   },
                   onQuit: { [weak self] in self?.quit() })
+        TTY.queryBackground()
         draw()
 
         let input = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: .main)
@@ -139,7 +138,7 @@ final class CLIApp {
         rain.schedule(deadline: .now() + 0.12, repeating: 0.12)
         rain.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.focused, self.showingNow, self.artwork.isLoaded,
+                guard let self, self.showingNow, self.artwork.isLoaded,
                       self.player.isPlaying, !self.player.isWaiting else { return }
                 self.rainFrame += 1
                 self.draw()
@@ -293,9 +292,20 @@ final class CLIApp {
     // MARK: - Keys
 
     private func handle(_ key: Key) {
-        if case .focus(let isFocused) = key {
-            focused = isFocused
+        switch key {
+        case .focus(true):
+            TTY.queryBackground()  // The appearance may have changed while away.
             return
+        case .focus:
+            return
+        case .background(let light):
+            if light != TTY.light {
+                TTY.light = light
+                drawnArt = nil
+            }
+            return
+        default:
+            break
         }
         if asking {
             handleAsk(key)
@@ -767,7 +777,7 @@ final class CLIApp {
 
         // The rain falls only while music plays; paused, the cover holds still.
         let frame = player.isPlaying && !player.isWaiting ? rainFrame : nil
-        let layout = "\(artwork.key ?? "-")|\(artwork.isLoaded)|\(showArt)|\(artRows)|\(artCol)|\(artTop)|\(rows)x\(width)"
+        let layout = "\(TTY.light)|\(artwork.key ?? "-")|\(artwork.isLoaded)|\(showArt)|\(artRows)|\(artCol)|\(artTop)|\(rows)x\(width)"
         let key = layout + "|\(frame ?? 0)"
         if key != drawnArt {
             // A new layout clears the screen; a new frame just writes over the cover.

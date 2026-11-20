@@ -17,16 +17,24 @@ enum Key: Equatable {
     case paste(String)
     /// Focus reporting: the window gained (true) or lost focus.
     case focus(Bool)
+    /// The terminal's answer to the background colour query (OSC 11): light or dark.
+    case background(light: Bool)
 }
 
 enum TTY {
-    // Styling. The accent is the coral of the app icon.
+    // Styling. The accent is the coral of the app icon, deeper on a light background.
     static let reset = "\u{1B}[0m"
     static let bold = "\u{1B}[1m"
     static let dim = "\u{1B}[2m"
-    static let accent = "\u{1B}[38;2;255;112;110m"
+    static var accent: String { light ? "\u{1B}[38;2;214;70;68m" : "\u{1B}[38;2;255;112;110m" }
     static let accentBG = "\u{1B}[48;2;255;112;110m\u{1B}[38;2;20;20;20m"
-    static let pink = "\u{1B}[38;2;255;92;160m"
+    static var pink: String { light ? "\u{1B}[38;2;200;30;120m" : "\u{1B}[38;2;255;92;160m" }
+
+    /// The terminal's background is light (its answer to `queryBackground`). Dark until it answers.
+    static var light = false
+
+    /// Asks for the background colour (OSC 11); the answer arrives as `.background`.
+    static func queryBackground() { write("\u{1B}]11;?\u{07}") }
     static let clearLine = "\u{1B}[2K"
 
     private static var original: termios?
@@ -106,6 +114,22 @@ enum TTY {
     private static var pasting: [UInt8]?
     private static let pasteEnd: [UInt8] = [0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]  // ESC [ 201 ~
 
+    /// An OSC reply (ESC ] … BEL or ESC \\) still arriving.
+    private static var osc: [UInt8]?
+
+    /// The finished OSC reply, as a key when it is the background colour.
+    private static func oscKey(_ body: [UInt8]) -> Key? {
+        // "11;rgb:RRRR/GGGG/BBBB", each channel 1 to 4 hex digits.
+        let text = String(decoding: body, as: UTF8.self)
+        guard text.hasPrefix("11;rgb:") else { return nil }
+        let channels = text.dropFirst(7).split(separator: "/").compactMap { part -> Double? in
+            guard (1...4).contains(part.count), let v = UInt32(part, radix: 16) else { return nil }
+            return Double(v) / Double((1 << (4 * part.count)) - 1)
+        }
+        guard channels.count == 3 else { return nil }
+        return .background(light: 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2] > 0.5)
+    }
+
     /// Decodes one read's worth of bytes into keys. An escape sequence always
     /// arrives in a single read from a terminal; a lone ESC byte is Escape.
     /// A bracketed paste (ESC [ 200 ~ … ESC [ 201 ~) becomes one `.paste`.
@@ -113,6 +137,31 @@ enum TTY {
         var keys: [Key] = []
         var i = 0
         while i < bytes.count {
+            if var body = osc {
+                // Up to BEL, or ST (ESC \\); the reply itself is never keys. It can span reads.
+                let before = body.count
+                body.append(contentsOf: bytes[i...])
+                var bodyEnd: Int?, end = 0
+                var k = 0
+                while k < body.count {
+                    if body[k] == 0x07 { bodyEnd = k; end = k + 1; break }
+                    if body[k] == 0x1B {
+                        guard k + 1 < body.count else { break }  // The backslash comes next read.
+                        bodyEnd = k
+                        end = k + (body[k + 1] == 0x5C ? 2 : 1)
+                        break
+                    }
+                    k += 1
+                }
+                guard let bodyEnd else {
+                    osc = body
+                    break
+                }
+                if let key = oscKey(Array(body[..<bodyEnd])) { keys.append(key) }
+                osc = nil
+                i += end - before
+                continue
+            }
             if var pasted = pasting {
                 pasted.append(contentsOf: bytes[i...])
                 if let end = pasted.firstRange(of: pasteEnd) {
@@ -144,6 +193,10 @@ enum TTY {
                     }
                     if let key = csiKey(final: bytes[j], first: first) { keys.append(key) }
                     i = j + 1
+                } else if i + 1 < bytes.count, bytes[i + 1] == 0x5D {
+                    // OSC: a terminal's reply to a query.
+                    osc = []
+                    i += 2
                 } else if i + 2 < bytes.count, bytes[i + 1] == 0x4F {
                     // SS3: ESC O and one final byte.
                     if let key = csiKey(final: bytes[i + 2], first: "") { keys.append(key) }
