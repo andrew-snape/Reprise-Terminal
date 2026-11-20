@@ -1,0 +1,627 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// Copyright (C) 2025-2026 Bain Gurley
+
+//
+//  PlexLiveTVProvider.swift
+//  Rivulet
+//
+//  LiveTVProvider implementation for Plex Live TV
+//
+
+import Foundation
+import OSLog
+
+/// LiveTVProvider implementation for Plex Live TV
+actor PlexLiveTVProvider: LiveTVProvider {
+
+    // MARK: - Properties
+
+    let sourceType: LiveTVSourceType = .plex
+    let sourceId: String
+    let displayName: String
+
+    let serverURL: String  // Exposed for persistence
+    private let authToken: String
+    private let networkManager = PlexNetworkManager.shared
+
+    // Cached data
+    private var cachedChannels: [UnifiedChannel] = []
+    private var cachedEPG: [String: [UnifiedProgram]] = [:]
+    /// Time range the merged `cachedEPG` covers, so a cache hit is served only
+    /// when it spans the requested window (see the lazy-load note in fetchEPG).
+    private var cachedEPGRange: (start: Date, end: Date)?
+    private var lastChannelFetch: Date?
+    private var lastEPGFetch: Date?
+    private var capabilities: PlexLiveTVCapabilities?
+
+    // Cache duration
+    private let channelCacheDuration: TimeInterval = 300  // 5 minutes
+    private let epgCacheDuration: TimeInterval = 1800     // 30 minutes
+
+    // MARK: - Initialization
+
+    init(serverURL: String, authToken: String, serverName: String) {
+        self.serverURL = serverURL
+        self.authToken = authToken
+        self.sourceId = "plex:\(serverURL)"
+        self.displayName = "\(serverName) Live TV"
+    }
+
+    // MARK: - LiveTVProvider Protocol
+
+    var isConnected: Bool {
+        get async {
+            // Check if Plex Live TV is available
+            do {
+                if let caps = capabilities {
+                    return caps.liveTVEnabled
+                }
+                let caps = try await networkManager.getLiveTVCapabilities(
+                    serverURL: serverURL,
+                    authToken: authToken
+                )
+                return caps.liveTVEnabled
+            } catch {
+                return false
+            }
+        }
+    }
+
+    func fetchChannels() async throws -> [UnifiedChannel] {
+        // Return cached if still valid
+        if let lastFetch = lastChannelFetch,
+           Date().timeIntervalSince(lastFetch) < channelCacheDuration,
+           !cachedChannels.isEmpty {
+
+            return cachedChannels
+        }
+
+        return try await refreshChannels()
+    }
+
+    func refreshChannels() async throws -> [UnifiedChannel] {
+
+        // First check capabilities
+        let caps = try await networkManager.getLiveTVCapabilities(
+            serverURL: serverURL,
+            authToken: authToken
+        )
+        capabilities = caps
+
+        guard caps.liveTVEnabled else {
+            throw LiveTVProviderError.notConnected
+        }
+
+        // Fetch channels
+        let plexChannels = try await networkManager.getLiveTVChannels(
+            serverURL: serverURL,
+            authToken: authToken
+        )
+
+        // Favourites are account-level, not per-DVR, so this is ONE call for the
+        // whole lineup. Rank is array position: that is the order the user
+        // arranged, and the merged channel list is sorted by number, which would
+        // otherwise throw it away. Best effort — an account with none, or a call
+        // that fails, simply yields no Favourites tab.
+        //
+        // NOT `self.authToken`. This provider is constructed with
+        // `selectedServerToken`, and a server token is rejected by the provider
+        // hosts — the same account-vs-server trap the Discover endpoints
+        // document. Read the account token directly for this one call: they are
+        // the account's favourites, so another Home profile gets none.
+        var favouriteRanks: [String: Int] = [:]
+        if let accountToken = await PlexAuthManager.shared.accountContentToken {
+            let favourites = await networkManager.getFavoriteChannelIdentifiers(authToken: accountToken)
+            for (index, identifier) in favourites.enumerated() where favouriteRanks[identifier] == nil {
+                favouriteRanks[identifier] = index
+            }
+        }
+
+        // Convert to UnifiedChannel
+        let channels = plexChannels.map { plexChannel in
+            let rank = plexChannel.channelIdentifier.flatMap { favouriteRanks[$0] }
+            return plexChannel.toUnifiedChannel(
+                sourceId: sourceId,
+                serverURL: serverURL,
+                authToken: authToken,
+                favouriteRank: rank
+            )
+        }
+
+        // Update cache
+        cachedChannels = channels
+        lastChannelFetch = Date()
+
+        return channels
+    }
+
+    func fetchEPG(
+        for channels: [UnifiedChannel],
+        startDate: Date,
+        endDate: Date
+    ) async throws -> [String: [UnifiedProgram]] {
+        // Serve from cache only when it's fresh AND actually COVERS the
+        // requested range. The guide's lazy horizontal loading asks for later
+        // windows ([loadedEnd, loadedEnd+chunk]); a range-blind cache would
+        // return the initial grid filtered to empty and stall the extension.
+        if let lastFetch = lastEPGFetch,
+           Date().timeIntervalSince(lastFetch) < epgCacheDuration,
+           let range = cachedEPGRange,
+           range.start <= startDate, range.end >= endDate,
+           !cachedEPG.isEmpty {
+            return filterEPG(cachedEPG, channels: channels, startDate: startDate, endDate: endDate)
+        }
+
+        // Build channel ID list for filtering
+        let channelRatingKeys = channels.compactMap { channel -> String? in
+            // Extract the rating key from the unified ID (plex:serverURL:ratingKey)
+            let components = channel.id.split(separator: ":")
+            return components.count >= 3 ? String(components.last!) : nil
+        }
+
+        // Fetch guide data
+        let guideChannels = try await networkManager.getLiveTVGuide(
+            serverURL: serverURL,
+            authToken: authToken,
+            channelIds: channelRatingKeys.isEmpty ? nil : channelRatingKeys,
+            startTime: startDate,
+            endTime: endDate
+        )
+
+        // Build unified channel ID lookup
+        // Use uniquingKeysWith to handle duplicate ratingKeys (keep first occurrence)
+        let ratingKeyToUnifiedId = Dictionary(
+            channels.map { channel -> (String, String) in
+                let components = channel.id.split(separator: ":")
+                let ratingKey = components.count >= 3 ? String(components.last!) : channel.id
+                return (ratingKey, channel.id)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        // Convert to UnifiedProgram
+        var unifiedEPG: [String: [UnifiedProgram]] = [:]
+        var matchedChannels = 0
+        var unmatchedChannels: [String] = []
+
+        for guideChannel in guideChannels {
+            guard let ratingKey = guideChannel.ratingKey else {
+                AppLog.liveTV.warning("Guide channel missing ratingKey")
+                continue
+            }
+
+            guard let unifiedChannelId = ratingKeyToUnifiedId[ratingKey] else {
+                unmatchedChannels.append(ratingKey)
+                continue
+            }
+
+            guard let programs = guideChannel.Metadata else {
+                continue
+            }
+
+            matchedChannels += 1
+
+            let unifiedPrograms = programs.compactMap { plexProgram -> UnifiedProgram? in
+                let result = plexProgram.toUnifiedProgram(unifiedChannelId: unifiedChannelId, serverURL: serverURL, authToken: authToken)
+                if result == nil {
+                    AppLog.liveTV.warning("Failed to convert program '\(plexProgram.title)' - beginsAt: \(String(describing: plexProgram.beginsAt)), endsAt: \(String(describing: plexProgram.endsAt))")
+                }
+                return result
+            }
+
+            if !unifiedPrograms.isEmpty {
+                unifiedEPG[unifiedChannelId] = unifiedPrograms
+            }
+        }
+
+        // Update cache: MERGE this window into the retained grid (append +
+        // de-dupe by id) and widen the covered range, so a later lazy-load
+        // window adds to what's cached instead of replacing it.
+        for (channelId, programs) in unifiedEPG {
+            var existing = cachedEPG[channelId] ?? []
+            let known = Set(existing.map(\.id))
+            existing.append(contentsOf: programs.filter { !known.contains($0.id) })
+            existing.sort { $0.startTime < $1.startTime }
+            cachedEPG[channelId] = existing
+        }
+        if let range = cachedEPGRange {
+            cachedEPGRange = (min(range.start, startDate), max(range.end, endDate))
+        } else {
+            cachedEPGRange = (startDate, endDate)
+        }
+        lastEPGFetch = Date()
+
+        return unifiedEPG
+    }
+
+    func getCurrentProgram(for channel: UnifiedChannel) async -> UnifiedProgram? {
+        guard let programs = cachedEPG[channel.id] else {
+            return nil
+        }
+
+        let now = Date()
+        return programs.first { program in
+            program.startTime <= now && program.endTime > now
+        }
+    }
+
+    nonisolated func buildStreamURL(for channel: UnifiedChannel) -> URL? {
+        guard let originalURL = channel.streamURL else {
+
+            return nil
+        }
+
+        // For Plex transcode URLs, generate a fresh session ID each time
+        // The session ID was baked in when channels were fetched, but Plex
+        // may reject reused session IDs for subsequent playback attempts
+        guard originalURL.path.contains("/transcode/") else {
+            // HDHomeRun or other direct URLs - use as-is
+
+            return originalURL
+        }
+
+        // Replace the session parameter with a fresh UUID
+        guard var components = URLComponents(url: originalURL, resolvingAgainstBaseURL: false) else {
+            AppLog.liveTV.error("Failed to parse URL components for '\(channel.name)'")
+
+            return originalURL
+        }
+
+        let newSessionId = UUID().uuidString.uppercased()
+        var queryItems = components.queryItems ?? []
+
+        // Find and replace the session parameter
+        if let sessionIndex = queryItems.firstIndex(where: { $0.name == "session" }) {
+            queryItems[sessionIndex] = URLQueryItem(name: "session", value: newSessionId)
+        } else {
+            // No session parameter exists, add one
+            queryItems.append(URLQueryItem(name: "session", value: newSessionId))
+        }
+
+        components.queryItems = queryItems
+        // Reassigning queryItems decoded the profile's %2B separators back to
+        // raw '+'. Without this the rebuilt URL reaches PMS with spaces between
+        // the client-profile clauses. See finalizedLiveURL.
+        let newURL = PlexLiveTVChannel.finalizedLiveURL(components) ?? originalURL
+
+        return newURL
+    }
+
+    /// Resolve a playable URL. Plex live channels go THROUGH Plex, but as a
+    /// continuous HTTP MPEG-TS stream — not HLS:
+    ///   1. POST /livetv/dvrs/{dvr}/channels/{id}/tune → livetv session uuid
+    ///   2. GET /video/:/transcode/universal/start.ts?protocol=http&
+    ///      container=mpegts&directPlay=1&directStream=1&
+    ///      path=/livetv/sessions/{uuid}&…
+    /// directPlay=1 asks the server to pass the RAW tuner TS straight through;
+    /// directStream=1 is its own fallback (remux, no re-encode — the client
+    /// profile declares the raw broadcast codecs). "Continuous" refers to the
+    /// HTTP delivery, NOT scan type: the video inside may be interlaced, which
+    /// AetherEngine deinterlaces (bwdif) after demuxing client-side — along
+    /// with the odd subtitle tracks (DVB/teletext). HDHomeRun direct URLs pass
+    /// through untouched (raw TS → same engine path).
+    func resolveStreamURL(for channel: UnifiedChannel) async throws -> URL? {
+        guard let base = buildStreamURL(for: channel) else { return nil }
+
+        guard let baseComponents = URLComponents(url: base, resolvingAgainstBaseURL: false),
+              let epgPath = baseComponents.queryItems?.first(where: { $0.name == "path" })?.value,
+              epgPath.hasPrefix("/tv.plex.providers.epg") else {
+            return base  // Direct URL or non-EPG path — playable as-is.
+        }
+
+        // epgPath = /tv.plex.providers.epg.cloud:157/metadata/<channelId>
+        // `base` itself is never playable from here on: the transcoder answers
+        // a guide-entry path with 400, every time.
+        let parts = epgPath.split(separator: "/")
+        guard parts.count >= 3,
+              let dvrKey = parts[0].split(separator: ":").last.map(String.init) else {
+            return nil
+        }
+        let channelId = String(parts[2])
+
+        // Unstructured, so a caller that leaves (Back, a channel switch)
+        // doesn't hang up on PMS mid-tune. PMS finishes the tune anyway and
+        // holds its grab, and only the response names the session to release.
+        let tune = try await Task {
+            try await networkManager.tuneLiveTVChannel(
+                serverURL: serverURL,
+                authToken: authToken,
+                dvrKey: dvrKey,
+                channelIdentifier: channelId
+            )
+        }.value
+
+        let transcodeSessionId = UUID().uuidString
+
+        // Ask the transcoder to DECIDE (server-authoritative). directPlay=1
+        // requests the raw session playlist — original streams intact,
+        // DVB teletext and mp2 included, no transcoder. Anything short of
+        // an explicit grant falls to the consensus start.m3u8 leg (the
+        // flow every working third-party client ships).
+        var directPlayKey: String?
+        do {
+            let decision = try await networkManager.requestLiveTranscodeDecision(
+                serverURL: serverURL,
+                authToken: authToken,
+                sessionPath: tune.sessionPath,
+                sessionIdentifier: tune.sessionIdentifier,
+                transcodeSessionId: transcodeSessionId,
+                directPlay: true
+            )
+            if decision.mdeDecisionCode == 1000, let key = decision.directPlayPartKey {
+                directPlayKey = key
+            }
+        } catch {
+            // Decision failing is not fatal — start.m3u8 with the tuned
+            // path is self-sufficient.
+        }
+
+        let url = directPlayKey.flatMap { directPlayURL(partKey: $0, tune: tune) }
+            ?? startURL(tune: tune, transcodeSessionId: transcodeSessionId)
+        guard let url else { return nil }
+        if Task.isCancelled {
+            await PlexLiveTimelineKeepalive.release(url)
+            return nil
+        }
+        return url
+    }
+
+    /// Raw session HLS. The part key already carries offset and
+    /// X-Plex-Incomplete-Segments; add auth + the session identity
+    /// (the keepalive parses both back out of the URL).
+    private func directPlayURL(partKey: String, tune: PlexLiveTVTuneResult) -> URL? {
+        guard var dp = URLComponents(string: "\(serverURL)\(partKey)") else { return nil }
+        var items = dp.queryItems ?? []
+        items.append(URLQueryItem(name: "X-Plex-Session-Identifier", value: tune.sessionIdentifier))
+        if let ratingKey = tune.ratingKey {
+            items.append(URLQueryItem(name: "rivuletLiveRatingKey", value: ratingKey))
+        }
+        if let scan = tune.videoScanType {
+            items.append(URLQueryItem(name: "rivuletLiveScanType", value: scan))
+        }
+        items.append(URLQueryItem(name: "X-Plex-Token", value: authToken))
+        dp.queryItems = items
+        // Reassigning queryItems re-serialises whatever the part key
+        // carried, so it goes through the same '+' rule as every
+        // other live URL.
+        return PlexLiveTVChannel.finalizedLiveURL(dp)
+    }
+
+    /// Consensus leg: start.m3u8 on the tuned session path, same query
+    /// set as the decision so PMS links them to one session.
+    private func startURL(tune: PlexLiveTVTuneResult, transcodeSessionId: String) -> URL? {
+        guard var start = URLComponents(string: "\(serverURL)/video/:/transcode/universal/start.m3u8") else {
+            return nil
+        }
+        var items = PlexLiveTVChannel.universalLiveQueryItems(
+            sessionPath: tune.sessionPath,
+            sessionIdentifier: tune.sessionIdentifier,
+            transcodeSessionId: transcodeSessionId,
+            directPlay: false,
+            authToken: authToken
+        )
+        if let ratingKey = tune.ratingKey {
+            items.append(URLQueryItem(name: "rivuletLiveRatingKey", value: ratingKey))
+        }
+        // Carried on the URL rather than threaded through LiveTVDataStore,
+        // matching how the ratingKey above already reaches the keepalive.
+        // `AetherPlayer.needsDeinterlacing` reads it back.
+        if let scan = tune.videoScanType {
+            items.append(URLQueryItem(name: "rivuletLiveScanType", value: scan))
+        }
+        start.queryItems = items
+        return PlexLiveTVChannel.finalizedLiveURL(start)
+    }
+
+    // MARK: - Private Methods
+
+    private func filterEPG(
+        _ epg: [String: [UnifiedProgram]],
+        channels: [UnifiedChannel],
+        startDate: Date,
+        endDate: Date
+    ) -> [String: [UnifiedProgram]] {
+        let channelIds = Set(channels.map { $0.id })
+
+        var filtered: [String: [UnifiedProgram]] = [:]
+
+        for (channelId, programs) in epg {
+            guard channelIds.contains(channelId) else { continue }
+
+            let filteredPrograms = programs.filter { program in
+                program.endTime > startDate && program.startTime < endDate
+            }
+
+            if !filteredPrograms.isEmpty {
+                filtered[channelId] = filteredPrograms
+            }
+        }
+
+        return filtered
+    }
+
+    // MARK: - Cache Management
+
+    func clearCache() {
+        cachedChannels = []
+        cachedEPG = [:]
+        cachedEPGRange = nil
+        lastChannelFetch = nil
+        lastEPGFetch = nil
+        capabilities = nil
+    }
+
+    // MARK: - Capability Check
+
+    /// Check if Plex Live TV is available (call this before adding as a source)
+    static func checkAvailability(serverURL: String, authToken: String) async -> Bool {
+        do {
+            let caps = try await PlexNetworkManager.shared.getLiveTVCapabilities(
+                serverURL: serverURL,
+                authToken: authToken
+            )
+            return caps.liveTVEnabled
+        } catch {
+            return false
+        }
+    }
+}
+
+// MARK: - DVR
+
+extension PlexLiveTVProvider: LiveTVRecordingProvider {
+
+    /// Plex's own ways to record this airing, from the subscription template,
+    /// relabelled plainly. A show rule whose template carries the new-airings
+    /// preference is offered twice: every airing, and new episodes only.
+    func recordOptions(for program: UnifiedProgram, on channel: UnifiedChannel) async throws -> [LiveTVRecordOption] {
+        guard program.endTime > Date() else { throw LiveTVRecordingError.programEnded }
+        guard let guid = program.sourceGuid, !guid.isEmpty else { throw LiveTVRecordingError.noGuideIdentity }
+
+        let templates = try await networkManager.getSubscriptionTemplate(
+            serverURL: serverURL,
+            authToken: authToken,
+            guid: guid
+        )
+        let encoder = JSONEncoder()
+        var options: [LiveTVRecordOption] = []
+        for (index, template) in templates.enumerated() {
+            let isSeries = template.type == 2
+            // `onlyNewAirings` is an enum (0 every airing, 1 new only), and the
+            // template's current value is the server's last choice, so both
+            // series options state theirs rather than inheriting it.
+            let hasAiringsPref = isSeries && template.prefs["onlyNewAirings"] != nil
+            let template = hasAiringsPref ? template.withOnlyNewAirings(false) : template
+            let title: String
+            switch template.type {
+            // Plex types every non-episodic guide airing (sport, news) as a
+            // movie, so "Record Movie" mislabelled most of them.
+            case 1: title = "Record"
+            case 2: title = "Record Series"
+            case 4: title = "Record Episode"
+            default: title = "Record \(template.title)"
+            }
+            guard let payload = try? String(decoding: encoder.encode(template), as: UTF8.self) else { continue }
+            options.append(LiveTVRecordOption(
+                id: "\(guid)#\(index)",
+                title: title,
+                scope: isSeries ? .series : .single,
+                payload: payload
+            ))
+            // Same rule, new airings only, when the template lets us ask.
+            if hasAiringsPref {
+                if let newPayload = try? String(decoding: encoder.encode(template.withOnlyNewAirings(true)), as: UTF8.self) {
+                    options.append(LiveTVRecordOption(
+                        id: "\(guid)#\(index)#new",
+                        title: "Record New Episodes",
+                        scope: .series,
+                        payload: newPayload
+                    ))
+                }
+            }
+        }
+        // Single airing first, then the series options.
+        return options.sorted { lhs, rhs in lhs.scope == .single && rhs.scope == .series }
+    }
+
+    func record(_ option: LiveTVRecordOption, program: UnifiedProgram, on channel: UnifiedChannel) async throws {
+        let template = try JSONDecoder().decode(PlexSubscriptionTemplateOption.self, from: Data(option.payload.utf8))
+        try await networkManager.createSubscription(serverURL: serverURL, authToken: authToken, option: template)
+    }
+
+    func scheduledRecordings() async throws -> [LiveTVScheduledRecording] {
+        let grabs = try await networkManager.getScheduledRecordings(serverURL: serverURL, authToken: authToken)
+        // Rule types say which grabs belong to a series rule. Best effort: a
+        // failure here only loses the "cancel series" distinction.
+        let rules = (try? await networkManager.getSubscriptions(serverURL: serverURL, authToken: authToken)) ?? []
+        let seriesRuleIds = Set(rules.filter { $0.type == 2 }.map(\.id))
+
+        return grabs.compactMap { grab -> LiveTVScheduledRecording? in
+            guard let start = grab.beginsAt, let end = grab.endsAt else { return nil }
+            let status: LiveTVScheduledRecording.Status
+            switch grab.status {
+            case "inprogress", "postprocessing": status = .recording
+            case "complete": status = .completed
+            case "error": status = .failed
+            case "cancelled": status = .cancelled
+            default: status = .scheduled
+            }
+            let channelId = grab.channelIdentifier.map {
+                UnifiedChannel.makeId(sourceType: .plex, sourceId: sourceId, channelId: $0)
+            }
+            var recording = LiveTVScheduledRecording(
+                id: grab.id,
+                sourceId: sourceId,
+                title: grab.grandparentTitle ?? grab.title,
+                subtitle: grab.grandparentTitle != nil ? grab.title : nil,
+                startTime: start,
+                endTime: end,
+                status: status,
+                channelName: grab.channelTitle,
+                channelId: channelId,
+                programGuid: grab.guid,
+                ruleId: grab.subscriptionId,
+                posterURL: grab.thumb.flatMap { Self.imageURL($0, serverURL: serverURL, authToken: authToken) }
+            )
+            recording.ruleIsSeries = grab.subscriptionId.map { seriesRuleIds.contains($0) } ?? false
+            return recording
+        }
+        .sorted { $0.startTime < $1.startTime }
+    }
+
+    /// One airing. A single-airing rule is removed outright (cancelling its
+    /// only grab would leave an empty rule behind); a series rule keeps going
+    /// and only this airing's grab is cancelled.
+    func cancel(_ recording: LiveTVScheduledRecording) async throws {
+        if let ruleId = recording.ruleId, !recording.ruleIsSeries {
+            try await networkManager.deleteSubscription(serverURL: serverURL, authToken: authToken, id: ruleId)
+        } else {
+            try await networkManager.cancelGrab(serverURL: serverURL, authToken: authToken, operationId: recording.id)
+        }
+    }
+
+    func recordingRules() async throws -> [LiveTVRecordingRule] {
+        let rules = try await networkManager.getSubscriptions(serverURL: serverURL, authToken: authToken)
+        return rules.map { rule in
+            var detail: [String] = []
+            // Type 1 is not labelled: Plex files sport and news as movies too.
+            switch rule.type {
+            case 2: detail.append(rule.airingsType ?? "Series")
+            case 4: detail.append("Episode")
+            default: break
+            }
+            if rule.scheduledCount > 0 {
+                detail.append(rule.scheduledCount == 1 ? "1 scheduled" : "\(rule.scheduledCount) scheduled")
+            }
+            if let library = rule.librarySectionTitle { detail.append(library) }
+            return LiveTVRecordingRule(
+                id: rule.id,
+                sourceId: sourceId,
+                title: rule.title,
+                detail: detail.isEmpty ? nil : detail.joined(separator: " · ")
+            )
+        }
+    }
+
+    func delete(_ rule: LiveTVRecordingRule) async throws {
+        try await networkManager.deleteSubscription(serverURL: serverURL, authToken: authToken, id: rule.id)
+    }
+
+    private nonisolated static func imageURL(_ path: String, serverURL: String, authToken: String) -> URL? {
+        if path.hasPrefix("http://") || path.hasPrefix("https://") { return URL(string: path) }
+        return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(authToken)")
+    }
+}
+
+private extension PlexSubscriptionTemplateOption {
+    /// This rule with Plex's airings preference set: every airing, or new only.
+    nonisolated func withOnlyNewAirings(_ newOnly: Bool) -> Self {
+        Self(title: title, type: type, parameters: parameters,
+             targetLibrarySectionID: targetLibrarySectionID,
+             targetSectionLocationID: targetSectionLocationID,
+             librarySectionTitle: librarySectionTitle,
+             airingsType: airingsType,
+             prefs: prefs.merging(["onlyNewAirings": newOnly ? "1" : "0"]) { _, new in new },
+             selected: selected)
+    }
+}
