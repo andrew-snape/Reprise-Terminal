@@ -154,6 +154,11 @@ enum TTY {
                     k += 1
                 }
                 guard let bodyEnd else {
+                    // No end in sight: a stray ESC ] (Option-] as Meta), not a reply. Let keys through.
+                    if body.count > 64 {
+                        osc = nil
+                        continue
+                    }
                     osc = body
                     break
                 }
