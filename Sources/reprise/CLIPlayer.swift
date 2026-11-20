@@ -58,6 +58,12 @@ final class CLIPlayer {
     private var fetching: Set<String> = []
     /// The current item failed to reach the server; it is retried after a reconnect.
     private(set) var needsReconnect = false
+    /// A restored queue's place, loaded only when play is pressed: AVPlayer reads
+    /// ahead even when paused, and a read left open makes Plex refuse the next
+    /// request for the same file on this session.
+    private var restoredAt: Double?
+    /// The track a refused file was retried for; a second refusal skips it.
+    private var refusedRetry: Int?
 
     /// Loudness levelling (Plex's gain analysis), on unless turned off.
     var levelling = true { didSet { applyVolume() } }
@@ -84,9 +90,9 @@ final class CLIPlayer {
     var current: PlexMetadata? { index.map { tracks[$0] } }
     var isPlaying: Bool { player.timeControlStatus != .paused || playAfterSeek }
     var isWaiting: Bool { needsReconnect || player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
-    var time: Double { pendingSeek ?? player.currentTime().seconds }
+    var time: Double { restoredAt ?? pendingSeek ?? player.currentTime().seconds }
     var duration: Double {
-        if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { return d }
+        if restoredAt == nil, let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { return d }
         return Double(current?.duration ?? 0) / 1000
     }
 
@@ -102,13 +108,26 @@ final class CLIPlayer {
 
     /// The queue from last time, paused where it stopped.
     func restore(_ list: [PlexMetadata], index start: Int, at time: Double) {
+        load(from: tracks.count)  // Clears anything loaded.
         tracks = list
         prefersAlbumGain = Set(list.map { $0.parentRatingKey ?? "" }).count == 1
-        load(from: start)
-        if time > 1 { pendingSeek = time }
+        index = start
+        restoredAt = time
     }
 
     func togglePause() {
+        if let at = restoredAt, let index {
+            // The restored queue is loaded now, at its place.
+            load(from: index)
+            if at > 1 {
+                pendingSeek = at
+                playAfterSeek = true
+            } else {
+                player.play()
+            }
+            report(force: true)
+            return
+        }
         if isPlaying {
             player.pause()
             playAfterSeek = false
@@ -124,6 +143,7 @@ final class CLIPlayer {
 
     func next() {
         guard let index, index + 1 < tracks.count else { return }
+        restoredAt = nil
         load(from: index + 1)
         player.play()
     }
@@ -133,6 +153,7 @@ final class CLIPlayer {
         if time > 3 || index == 0 {
             seek(to: 0)
         } else {
+            restoredAt = nil
             load(from: index - 1)
             player.play()
         }
@@ -144,6 +165,10 @@ final class CLIPlayer {
 
     func seek(to seconds: Double) {
         let target = max(0, min(seconds, duration - 1))
+        if restoredAt != nil {
+            restoredAt = target
+            return
+        }
         if pendingSeek != nil {
             pendingSeek = target
         } else {
@@ -157,7 +182,8 @@ final class CLIPlayer {
     func stop() async {
         saveState()
         player.pause()
-        let track = current
+        // A restored queue never played: Plex has nothing to hear about.
+        let track = restoredAt == nil ? current : nil
         let time = time
         let left = entries
         player.removeAllItems()
@@ -208,6 +234,11 @@ final class CLIPlayer {
         tracks.insert(contentsOf: list, at: at)
         shift(from: at, by: list.count)
         prefersAlbumGain = false
+        // A restored queue isn't loaded yet; the new tracks load with it.
+        if restoredAt != nil {
+            saveState()
+            return
+        }
         // Items go in after the one before `at`, which is always in AVPlayer's queue.
         var after = entries.first { $0.index == at - 1 }?.item
         for i in at..<(at + list.count) {
@@ -297,7 +328,29 @@ final class CLIPlayer {
 
         let now = player.currentItem.flatMap { entry(for: $0) }
         if now?.item !== followed?.item {
-            if let old = followed {
+            if let old = followed, old.item.status == .failed {
+                // AVQueuePlayer skipped a failed item on its own: it didn't play out.
+                // Plex refuses a file for a moment while an earlier read of it on
+                // this session closes, so it gets one retry before it is skipped.
+                forget(old)
+                followed = now
+                index = now?.index
+                if refusedRetry != old.index {
+                    refusedRetry = old.index
+                    let wanted = old.index
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                        MainActor.assumeIsolated {
+                            guard let self, self.index == wanted + 1 || self.index == nil,
+                                  self.tracks.indices.contains(wanted) else { return }
+                            self.load(from: wanted)
+                            self.player.play()
+                        }
+                    }
+                    return message
+                }
+                refusedRetry = nil
+                message = "\(tracks[old.index].title ?? "A track") wouldn't play, skipped."
+            } else if let old = followed {
                 // AVPlayer moved on by itself: the previous track played out.
                 scrobble(tracks[old.index])
                 forget(old)
@@ -310,6 +363,7 @@ final class CLIPlayer {
             followed = now
             index = now?.index
             if index != retriedIndex { retriedIndex = nil }
+            if index != refusedRetry { refusedRetry = nil }
             waitingSince = nil
             // A download for the track just left is no use now.
             if let d = download, d.index != index {
@@ -407,6 +461,7 @@ final class CLIPlayer {
     // MARK: - Loading
 
     private func load(from start: Int) {
+        restoredAt = nil
         // The old queue is left. AVPlayer only reads the current item and the next,
         // so only those two can have a transcoder running.
         for entry in entries.prefix(2) { Task { await stopTranscode(entry) } }

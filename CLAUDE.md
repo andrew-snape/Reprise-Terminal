@@ -106,7 +106,14 @@ Sources/reprise/
   with the hidden `reprise --ask "<text>"`.
 - **Saved queue**: `reprise-cli/queue.json` (rating keys, index, time, server id), written
   on track change, pause, queue edits and quit, deleted when the queue plays out; on launch
-  it comes back paused (batched `/library/metadata/k1,k2,…`).
+  it comes back paused (batched `/library/metadata/k1,k2,…`) but **nothing is loaded into
+  AVPlayer until play is pressed** (`restoredAt`). AVPlayer reads ahead even while paused,
+  and while that read is open Plex refuses a new request for the same file on this session
+  (-1008, CoreMedia -16849); AVQueuePlayer then skips the item by itself, which looked like
+  "starts at a different song each time".
+- **A failed item AVQueuePlayer skipped by itself** (the old item's status is `.failed` when
+  `tick()` sees the change) is not scrobbled: it is retried once after 1 s, then skipped
+  with a message.
 - **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into
   `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting. A copy that
   isn't used, or whose item is left, is deleted at once; the folder is also cleared on
