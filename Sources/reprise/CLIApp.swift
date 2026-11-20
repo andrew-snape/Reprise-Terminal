@@ -76,6 +76,8 @@ final class CLIApp {
     /// The Matrix rain's step, advanced while the Now Playing screen shows music playing.
     private var rainFrame = 1
     private var rainTimer: DispatchSourceTimer?
+    /// False while the window is in the background (focus reporting); the rain then stops.
+    private var focused = true
 
     /// The player owns the connection, so a reconnect changes it in one place.
     private var connection: CLIConnection { player.connection }
@@ -137,7 +139,7 @@ final class CLIApp {
         rain.schedule(deadline: .now() + 0.12, repeating: 0.12)
         rain.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.showingNow, self.artwork.isLoaded,
+                guard let self, self.focused, self.showingNow, self.artwork.isLoaded,
                       self.player.isPlaying, !self.player.isWaiting else { return }
                 self.rainFrame += 1
                 self.draw()
@@ -291,6 +293,10 @@ final class CLIApp {
     // MARK: - Keys
 
     private func handle(_ key: Key) {
+        if case .focus(let isFocused) = key {
+            focused = isFocused
+            return
+        }
         if asking {
             handleAsk(key)
             return
@@ -377,6 +383,8 @@ final class CLIApp {
         case .char("\u{03}"): quit()
         case .char(let c):
             askText.append(c)
+        case .paste(let text):
+            askText += text.pastedLine
         default:
             break
         }
@@ -483,6 +491,8 @@ final class CLIApp {
         case .char("\u{03}"): quit()
         case .char(let c):
             stack[stack.count - 1].filter.append(c)
+        case .paste(let text):
+            stack[stack.count - 1].filter += text.pastedLine
         default: return
         }
         // The matches changed: start again from the first.
@@ -632,7 +642,7 @@ final class CLIApp {
         if showingNow {
             drawNowPlaying(&out, rows: rows, width: width)
             drawFooter(&out, rows: rows, width: width)
-            TTY.write(out)
+            TTY.write(TTY.frame(out))
             return
         }
         drawnArt = nil
@@ -697,7 +707,7 @@ final class CLIApp {
             out += TTY.move(row: rows - 3) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
         }
         drawFooter(&out, rows: rows, width: width)
-        TTY.write(out)
+        TTY.write(TTY.frame(out))
     }
 
     /// The window title, and the last two lines: help, the ask or filter prompt, or a message.

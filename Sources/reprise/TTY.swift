@@ -13,6 +13,10 @@ enum Key: Equatable {
     case up, down, left, right, pageUp, pageDown, home, end
     case enter, escape, backspace, tab
     case char(Character)
+    /// Bracketed paste: the text, never read as keys.
+    case paste(String)
+    /// Focus reporting: the window gained (true) or lost focus.
+    case focus(Bool)
 }
 
 enum TTY {
@@ -46,7 +50,8 @@ enum TTY {
         }
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
         // Save the window title (xterm title stack) so quitting can put it back.
-        write("\u{1B}[22;0t\u{1B}[?1049h\u{1B}[?25l")
+        // Then focus reporting and bracketed paste, both ignored where unsupported.
+        write("\u{1B}[22;0t\u{1B}[?1049h\u{1B}[?25l\u{1B}[?1004h\u{1B}[?2004h")
 
         // SIGHUP: the window was closed. Quitting still tells Plex and saves the queue.
         for (sig, handler) in [(SIGINT, onQuit), (SIGTERM, onQuit), (SIGHUP, onQuit), (SIGWINCH, onResize)] {
@@ -61,7 +66,7 @@ enum TTY {
     static func restore() {
         guard var saved = original else { return }
         // An empty title first, for terminals without a title stack.
-        write("\u{1B}[0m\u{1B}[?25h\u{1B}[?1049l\u{1B}]2;\u{07}\u{1B}[23;0t")
+        write("\u{1B}[?2004l\u{1B}[?1004l\u{1B}[0m\u{1B}[?25h\u{1B}[?1049l\u{1B}]2;\u{07}\u{1B}[23;0t")
         lastTitle = nil
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved)
         original = nil
@@ -92,14 +97,34 @@ enum TTY {
 
     static func move(row: Int, col: Int = 1) -> String { "\u{1B}[\(row);\(col)H" }
 
+    /// Synchronized output (mode 2026): the terminal shows the frame whole, no tearing.
+    static func frame(_ text: String) -> String { "\u{1B}[?2026h" + text + "\u{1B}[?2026l" }
+
     // MARK: - Keys
+
+    /// A paste still arriving: it can span many reads.
+    private static var pasting: [UInt8]?
+    private static let pasteEnd: [UInt8] = [0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]  // ESC [ 201 ~
 
     /// Decodes one read's worth of bytes into keys. An escape sequence always
     /// arrives in a single read from a terminal; a lone ESC byte is Escape.
+    /// A bracketed paste (ESC [ 200 ~ … ESC [ 201 ~) becomes one `.paste`.
     static func decode(_ bytes: [UInt8]) -> [Key] {
         var keys: [Key] = []
         var i = 0
         while i < bytes.count {
+            if var pasted = pasting {
+                pasted.append(contentsOf: bytes[i...])
+                if let end = pasted.firstRange(of: pasteEnd) {
+                    let consumed = end.upperBound - (pasted.count - (bytes.count - i))
+                    keys.append(.paste(String(decoding: pasted[..<end.lowerBound], as: UTF8.self)))
+                    pasting = nil
+                    i += consumed
+                    continue
+                }
+                pasting = pasted
+                break
+            }
             let b = bytes[i]
             if b == 0x1B {
                 if i + 1 < bytes.count, bytes[i + 1] == 0x5B {
@@ -112,6 +137,11 @@ enum TTY {
                     // An unfinished sequence ends the read.
                     guard j < bytes.count, (0x40...0x7E).contains(bytes[j]) else { break }
                     let first = params.split(separator: ";").first.map(String.init) ?? ""
+                    if bytes[j] == 0x7E, first == "200" {
+                        pasting = []
+                        i = j + 1
+                        continue
+                    }
                     if let key = csiKey(final: bytes[j], first: first) { keys.append(key) }
                     i = j + 1
                 } else if i + 2 < bytes.count, bytes[i + 1] == 0x4F {
@@ -153,6 +183,8 @@ enum TTY {
         case 0x44: .left
         case 0x48: .home
         case 0x46: .end
+        case 0x49 where first.isEmpty: .focus(true)   // ESC [ I
+        case 0x4F where first.isEmpty: .focus(false)  // ESC [ O
         case 0x7E:
             switch first {
             case "1", "7": .home
@@ -204,6 +236,12 @@ extension String {
     /// Without control characters (metadata is untrusted).
     var printable: String {
         String(unicodeScalars.filter { $0.properties.generalCategory != .control }.map(Character.init))
+    }
+
+    /// Pasted text as one line for a prompt: line breaks and tabs become spaces,
+    /// other control characters are dropped.
+    var pastedLine: String {
+        split(whereSeparator: \.isNewline).joined(separator: " ").replacingOccurrences(of: "\t", with: " ").printable
     }
 
     /// Clipped to `width` columns, with an ellipsis when cut. Plain text only.

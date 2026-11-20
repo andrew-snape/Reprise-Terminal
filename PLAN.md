@@ -13,6 +13,9 @@ In order. Each step ships on its own.
 - **Skips fixed**: AVPlayer holds two items, `n` advances onto the queued one, a refused
   file is retried quietly before "Lost <server>".
 
+- **Terminal modes**: synchronized output, focus reporting (rain stops in the background),
+  bracketed paste into the prompts.
+
 ## Next
 
 - Verify in a real terminal: Now Playing from a bare CLI, the slow-start swap, levelling.

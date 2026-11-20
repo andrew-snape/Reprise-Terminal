@@ -98,6 +98,11 @@ Sources/reprise/
 - **Window title** is the playing track (OSC 2). The old title is pushed on enter
   (`CSI 22;0t`) and popped on restore (`CSI 23;0t`), after an empty title for terminals
   without a title stack.
+- **Terminal modes**: each frame is wrapped in synchronized output (`CSI ?2026h/l`,
+  `TTY.frame`). Focus reporting (`?1004`) stops the rain while the window is in the
+  background. Bracketed paste (`?2004`) arrives as one `.paste` key, even across reads, and
+  goes only into the ask and filter prompts as one line, so pasted text never runs commands.
+  Both modes are switched off in `restore`. Terminals without them ignore them.
 - **The main run loop runs** (`RunLoop.main.run()`, not `dispatchMain()`): MediaPlayer's
   remote commands need it. The main dispatch queue is still drained by it.
 - **Ask** (`:`, `CLIAsk`): a fresh `LanguageModelSession` per request, made and prewarmed
