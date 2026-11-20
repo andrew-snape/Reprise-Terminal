@@ -64,7 +64,8 @@ final class CLIApp {
     private var library: PlexLibrary?
     private var asking = false
     private var askText = ""
-    private var askSession: LanguageModelSession?
+    /// The session being made (and warmed up) while the request is typed; awaited on Enter.
+    private var askSession: Task<LanguageModelSession?, Never>?
     private var nowPlaying: CLINowPlaying?
 
     /// The player owns the connection, so a reconnect changes it in one place.
@@ -88,7 +89,11 @@ final class CLIApp {
             MainActor.assumeIsolated {
                 var buffer = [UInt8](repeating: 0, count: 64)
                 let n = read(STDIN_FILENO, &buffer, buffer.count)
-                guard n > 0 else { return }
+                guard n > 0 else {
+                    // The terminal went away (window closed): quit properly, don't spin on EOF.
+                    if n == 0 || (errno != EAGAIN && errno != EINTR) { self?.quit() }
+                    return
+                }
                 for key in TTY.decode(Array(buffer[0..<n])) { self?.handle(key) }
                 self?.draw()
             }
@@ -133,6 +138,7 @@ final class CLIApp {
     private func quit() {
         guard !quitting else { return }
         quitting = true
+        input?.cancel()
         Task {
             // Up to two seconds for Plex to hear "stopped".
             await withTaskGroup(of: Void.self) { group in
@@ -304,10 +310,8 @@ final class CLIApp {
         guard let library else { flash("No music library to ask."); return }
         asking = true
         askText = ""
-        askSession = nil
-        // Made and warmed up while the request is typed.
         let connection = connection
-        Task { askSession = await CLIAsk.session(connection: connection, section: library.key) }
+        askSession = Task { await CLIAsk.session(connection: connection, section: library.key) }
     }
 
     private func handleAsk(_ key: Key) {
@@ -330,9 +334,11 @@ final class CLIApp {
 
     private func runAsk(_ text: String) {
         guard let library else { return }
-        let session = askSession
+        let pending = askSession
         askSession = nil
         load(CLIAsk.isAvailable ? "Thinking…" : "Searching…") { [self] in
+            // A fast Enter waits for the session rather than falling back to keyword search.
+            let session = await pending?.value
             let result = try await CLIAsk.run(text, session: session, connection: connection, section: library.key)
             if !result.tracks.isEmpty {
                 act(on: result.tracks, action: result.action, label: result.label)

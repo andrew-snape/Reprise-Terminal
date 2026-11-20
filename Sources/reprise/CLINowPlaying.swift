@@ -23,10 +23,13 @@ final class CLINowPlaying {
         func handle(_ command: MPRemoteCommand, _ action: @escaping @MainActor (CLIPlayer) -> Void) {
             command.isEnabled = true
             command.addTarget { [weak player] _ in
-                MainActor.assumeIsolated {
-                    guard let player else { return }
-                    action(player)
-                    onChange()
+                // Not promised to arrive on the main thread: hop there.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let player else { return }
+                        action(player)
+                        onChange()
+                    }
                 }
                 return .success
             }
@@ -39,9 +42,11 @@ final class CLINowPlaying {
         center.changePlaybackPositionCommand.isEnabled = true
         center.changePlaybackPositionCommand.addTarget { [weak player] event in
             let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime
-            MainActor.assumeIsolated {
-                if let position { player?.seek(to: position) }
-                onChange()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    if let position { player?.seek(to: position) }
+                    onChange()
+                }
             }
             return .success
         }

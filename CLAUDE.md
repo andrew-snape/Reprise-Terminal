@@ -52,8 +52,10 @@ Sources/reprise/
   capture it weakly, and `run()` returns as soon as they are set up. Without the static it is
   freed after the first page loads: the screen freezes and even Ctrl-C does nothing (ISIG is
   off, so Ctrl-C arrives as byte 0x03 on the dead input source).
-- **The terminal is always restored**: on `q`, Ctrl-C (0x03), SIGINT and SIGTERM (dispatch
-  signal sources), and before printing a fatal error. SIGWINCH redraws.
+- **The terminal is always restored**: on `q`, Ctrl-C (0x03), SIGINT, SIGTERM and SIGHUP
+  (dispatch signal sources), on EOF or an error reading stdin (the window closed), and before
+  printing a fatal error. Every quit goes through `CLIApp.quit`, so Plex hears "stopped" and
+  the queue is saved. SIGWINCH redraws.
 - **Connections** (`CLISignIn.bestConnection`): every candidate is probed at once
   (`/identity`, 5 s) and the best that answers wins: local plex.direct, remote
   plex.direct, local plain HTTP (never loopback or Docker bridge), then relay. Raw-IP HTTPS is
@@ -91,7 +93,8 @@ Sources/reprise/
 - **The main run loop runs** (`RunLoop.main.run()`, not `dispatchMain()`): MediaPlayer's
   remote commands need it. The main dispatch queue is still drained by it.
 - **Ask** (`:`, `CLIAsk`): a fresh `LanguageModelSession` per request, made and prewarmed
-  when the prompt opens, greedy sampling. The model only fills `PlayRequest`; names it
+  when the prompt opens (the Task is awaited on Enter, so a fast Enter never falls back
+  to keyword search), greedy sampling. The model only fills `PlayRequest`; names it
   returns are kept only if every word was typed (`grounded`), since the small model adds
   names it knows ("Queen") and placeholders ("No artist specified"). Named requests go
   through `/hubs/search` (fuzzy: "saviours" finds "Saviors") plus the artist's own
@@ -105,8 +108,9 @@ Sources/reprise/
   on track change, pause, queue edits and quit, deleted when the queue plays out; on launch
   it comes back paused (batched `/library/metadata/k1,k2,…`).
 - **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into
-  `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting (cleared on
-  launch and quit). Never on relay or for a transcode.
+  `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting. A copy that
+  isn't used, or whose item is left, is deleted at once; the folder is also cleared on
+  launch and quit. Never on relay or for a transcode.
 - **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
   metadata (album gain when one album plays in order), set on the player when a track starts
   (the next item's on `didPlayToEndTime`, so no loud first moment).

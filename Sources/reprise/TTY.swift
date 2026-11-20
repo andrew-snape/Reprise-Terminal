@@ -48,7 +48,8 @@ enum TTY {
         // Save the window title (xterm title stack) so quitting can put it back.
         write("\u{1B}[22;0t\u{1B}[?1049h\u{1B}[?25l")
 
-        for (sig, handler) in [(SIGINT, onQuit), (SIGTERM, onQuit), (SIGWINCH, onResize)] {
+        // SIGHUP: the window was closed. Quitting still tells Plex and saves the queue.
+        for (sig, handler) in [(SIGINT, onQuit), (SIGTERM, onQuit), (SIGHUP, onQuit), (SIGWINCH, onResize)] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler { MainActor.assumeIsolated { handler() } }

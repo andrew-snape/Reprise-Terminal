@@ -32,8 +32,9 @@ final class CLIPlayer {
         var index: Int
         /// The transcoder's session, when the item is a transcode.
         let transcode: String?
-        /// Played from a downloaded copy.
-        var isLocal = false
+        /// The downloaded copy it plays from, deleted when the item is left.
+        var file: URL?
+        var isLocal: Bool { file != nil }
     }
 
     private(set) var tracks: [PlexMetadata] = []
@@ -231,6 +232,7 @@ final class CLIPlayer {
             } else {
                 let left = entries
                 player.removeAllItems()
+                for file in left.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
                 entries = []
                 followed = nil
                 index = nil
@@ -309,6 +311,11 @@ final class CLIPlayer {
             index = now?.index
             if index != retriedIndex { retriedIndex = nil }
             waitingSince = nil
+            // A download for the track just left is no use now.
+            if let d = download, d.index != index {
+                d.task.cancel()
+                download = nil
+            }
             applyVolume()
             if now != nil { saveState() }
         }
@@ -343,7 +350,10 @@ final class CLIPlayer {
         let track = tracks[index]
         let task = Task { [weak self] in
             guard let file = await Self.downloadWhole(url, track: track) else { return }
-            guard let self, !Task.isCancelled else { return }
+            guard let self, !Task.isCancelled else {
+                try? FileManager.default.removeItem(at: file)
+                return
+            }
             self.swapToFile(file, index: index)
         }
         download = (index, task)
@@ -352,10 +362,14 @@ final class CLIPlayer {
     private func swapToFile(_ file: URL, index: Int) {
         download = nil
         guard let old = followed, old.index == index,
-              player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+              player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
+            // It started (or moved on) without the copy: no use for it.
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
         let at = time
         let item = makeItem(file)
-        let entry = Entry(item: item, index: index, transcode: nil, isLocal: true)
+        let entry = Entry(item: item, index: index, transcode: nil, file: file)
         entries.append(entry)
         player.insert(item, after: old.item)
         entries.removeAll { $0.item === old.item }
@@ -396,6 +410,7 @@ final class CLIPlayer {
         // The old queue is left. AVPlayer only reads the current item and the next,
         // so only those two can have a transcoder running.
         for entry in entries.prefix(2) { Task { await stopTranscode(entry) } }
+        for file in entries.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
         download?.task.cancel()
         download = nil
         waitingSince = nil
@@ -432,6 +447,7 @@ final class CLIPlayer {
     /// An item that is done with: dropped, and its transcoder freed.
     private func forget(_ entry: Entry) {
         entries.removeAll { $0.item === entry.item }
+        if let file = entry.file { try? FileManager.default.removeItem(at: file) }
         Task { await stopTranscode(entry) }
     }
 
