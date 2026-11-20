@@ -17,7 +17,7 @@ foreground, stopping when the window closes.
   `RivuletCore`, because RivuletCore's types are internal.
 - **No dependencies.** AVFoundation plays; Foundation Models (ask), MediaPlayer (Now Playing)
   and Network (path changes) are system frameworks.
-- **Repo is private** for now. Keep commit messages short and plain.
+- **Repo is public** (since Nov 2026). Keep commit messages short and plain, and never commit tokens, server addresses or account details.
 
 ## Layout
 
