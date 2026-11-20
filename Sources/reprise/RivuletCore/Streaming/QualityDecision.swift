@@ -51,6 +51,17 @@ nonisolated enum QualityDecision {
         QualityStep.ladder.first { $0.kbps <= kbps } ?? QualityStep.ladder[QualityStep.ladder.count - 1]
     }
 
+    /// The step a failed or refused file falls back to: the setting's own step, Auto's measured one,
+    /// and the top step for Original, since the Mac has no uncapped transcode.
+    static func fallbackStep(setting: StreamingQuality, measuredKbps: Int?) -> QualityStep {
+        switch setting {
+        case .original: QualityStep.ladder[0]
+        case .step(let step): step
+        case .auto: highestStep(atMost: capKbps(setting: .auto, measuredKbps: measuredKbps, isRelay: false)
+                                ?? probeFailureStep.kbps)
+        }
+    }
+
     /// One step below what is playing, or nil at the bottom.
     static func stepDown(from plan: StreamPlan, sourceKbps: Int?) -> QualityStep? {
         let ceiling = plan.step?.kbps ?? sourceKbps ?? Int.max

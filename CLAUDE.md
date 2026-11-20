@@ -132,8 +132,8 @@ Sources/reprise/
   (the next item's on `didPlayToEndTime`, so no loud first moment).
 - **Now Playing screen** (`v`): the cover as Matrix-style text, one cell a pixel (a square
   cover is `2 × rows` cells across): half-width katakana (one column each) and digits in
-  16 shades of coral by brightness (contrast stretched), dark areas empty. While music
-  plays a 0.12 s timer moves drops of light down the columns and flickers a few glyphs;
+  the cover's own colour per cell, lifted by brightness (contrast stretched) since thin glyphs read darker; the one place outside coral and pink (contrast stretched), dark areas empty. While music
+  plays a 0.12 s timer moves drops of light (whitening the colour) down the columns and flickers a few glyphs;
   paused, it holds still and isn't redrawn. (Colour half blocks were tried first and
   looked poor.) Stacked and centred, or beside the words when the window is wide and
   short. Covers come from `/photo/:/transcode` at 600 px, one fetch per album, and also
@@ -144,7 +144,7 @@ Sources/reprise/
 ## Vendored RivuletCore
 
 `Sources/reprise/RivuletCore` is a straight copy of `RivuletCore/` from Reprise-Mac at commit
-`3ec87511` (version 0.79). Leave it unedited so it can be re-synced:
+`62a16f52` (version 0.80). Leave it unedited so it can be re-synced:
 
 ```sh
 rsync -a --delete ~/Developer/Reprise-Mac/RivuletCore/ Sources/reprise/RivuletCore/
@@ -177,4 +177,4 @@ that feeds `TTY.decode` byte arrays (e.g. `1B 5B 31 3B 32 41`, shift-up) and pri
 ## Design
 
 Calm and fast: one screen, keyboard only, the icon's coral (`TTY.accent`) and pink as the
-only colours, dim text for secondary information. No feature "just in case".
+only colours (the cover aside), dim text for secondary information. No feature "just in case".

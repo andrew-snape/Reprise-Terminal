@@ -248,7 +248,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         // Only Plex Media Servers. Each device's `machineIdentifier` is populated
         // at decode time from its `clientIdentifier` (the same value the old
         // pms/servers.xml fetch returned), so no separate round-trip is needed.
-        return devices.filter { $0.provides == "server" }
+        return devices.filter(\.isServer)
     }
 
     // MARK: - Library Browsing
@@ -449,7 +449,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             // Watchlist and Common Sense both key on the external tmdb:// guid,
             // and the Guid array is the only place a Plex-agent item carries one.
             URLQueryItem(name: "includeGuids", value: "1"),
-            URLQueryItem(name: "includeReviews", value: "1")
+            URLQueryItem(name: "includeReviews", value: "1"),
+            // Without it a version whose file was deleted looks playable.
+            URLQueryItem(name: "checkFiles", value: "1")
         ]
 
         guard let url = components.url else {
@@ -1010,9 +1012,14 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
     /// Opens a direct-play session on the server's dashboard with a decision call, so
     /// the play shows its bandwidth and can be stopped there (#423).
+    /// Returns true when the server refuses direct play over a remote connection: that is its own
+    /// rule (a remote stream or bandwidth limit), so the file would only fail. On the LAN a refusal
+    /// is never acted on: Plex then gives rules for clients that can't pick tracks ("Selected audio
+    /// stream is not the first audio stream"), which the engine doesn't share.
+    @discardableResult
     func openDirectPlaySession(serverURL: String, authToken: String, ratingKey: String,
-                               mediaIndex: Int, sessionIdentifier: String) async {
-        guard var components = URLComponents(string: "\(serverURL)/video/:/transcode/universal/decision") else { return }
+                               mediaIndex: Int, sessionIdentifier: String) async -> Bool {
+        guard var components = URLComponents(string: "\(serverURL)/video/:/transcode/universal/decision") else { return false }
         components.queryItems = [
             URLQueryItem(name: "path", value: "/library/metadata/\(ratingKey)"),
             URLQueryItem(name: "mediaIndex", value: String(mediaIndex)),
@@ -1021,14 +1028,41 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             URLQueryItem(name: "directPlay", value: "1"),
             URLQueryItem(name: "directStream", value: "0"),
             URLQueryItem(name: "X-Plex-Client-Profile-Name", value: "Generic"),
-            URLQueryItem(name: "X-Plex-Client-Profile-Extra",
-                         value: "add-direct-play-profile(type=videoProfile&protocol=http&container=*&videoCodec=*&audioCodec=*)"),
+            // Subtitles too: without them a file with a selected subtitle is refused.
+            URLQueryItem(name: "X-Plex-Client-Profile-Extra", value: [
+                "add-direct-play-profile(type=videoProfile&protocol=http&container=*&videoCodec=*&audioCodec=*&subtitleCodec=*)",
+                "add-direct-play-profile(type=subtitleProfile&container=*&subtitleCodec=*)",
+                "add-settings(DirectPlayStreamSelection=true)"
+            ].joined(separator: "+")),
             URLQueryItem(name: "X-Plex-Session-Identifier", value: sessionIdentifier)
         ]
-        guard let url = components.url else { return }
+        guard let url = PlexLiveTVChannel.finalizedLiveURL(components) else { return false }
         var headers = plexHeaders(authToken: authToken)
         headers["X-Plex-Session-Identifier"] = sessionIdentifier
-        _ = try? await requestData(url, method: "GET", headers: headers)
+        headers["Accept"] = "application/json"
+        guard let data = try? await requestData(url, method: "GET", headers: headers),
+              Self.refusesDirectPlay(data) else { return false }
+        AppLog.plexNetwork.notice("Direct-play decision refused: \(Self.directPlayDecisionText(data) ?? "no reason given", privacy: .public)")
+        return ServerLocation.classify(serverURL) != .local
+    }
+
+    /// The server's reason for its decision, for the log.
+    nonisolated static func directPlayDecisionText(_ data: Data) -> String? {
+        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let container = body["MediaContainer"] as? [String: Any] else { return nil }
+        let general = container["generalDecisionText"] as? String
+        let direct = container["directPlayDecisionText"] as? String
+        return container["directPlayDecisionCode"] as? Int == 1000 ? general : direct ?? general
+    }
+
+    /// Measured on PMS 1.43.5: an allowed decision carries `generalDecisionCode` 1000. A remote
+    /// bandwidth limit answers 2000 while `directPlayDecisionCode` still says 1000, so read the general code.
+    nonisolated static func refusesDirectPlay(_ data: Data) -> Bool {
+        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let container = body["MediaContainer"] as? [String: Any],
+              let code = container["generalDecisionCode"] as? Int ?? container["directPlayDecisionCode"] as? Int
+        else { return false }
+        return code != 1000
     }
 
     /// Mark item as watched

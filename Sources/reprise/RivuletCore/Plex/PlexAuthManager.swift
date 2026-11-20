@@ -191,7 +191,7 @@ class PlexAuthManager: ObservableObject {
         } == true
         let wantsTLS = Self.prefersSecureLocalConnections && url.hasPrefix("http://")
         if !wantsTLS, Self.isPlayableDirectURL(url),
-           savedIsLocal || server.connections?.contains { $0.local } != true { return }
+           savedIsLocal || server.connections?.contains(where: { $0.local }) != true { return }
         guard let best = await findBestConnection(for: server, reuseLastGood: false),
               Self.isPlayableDirectURL(best),
               best != url,
@@ -583,6 +583,39 @@ class PlexAuthManager: ObservableObject {
         }
     }
 
+    /// `http://<ip>:<port>` for a plex.direct URL naming a LAN address, else nil.
+    /// With no internet the router cannot resolve plex.direct names.
+    nonisolated static func lanFallbackURL(for urlString: String) -> String? {
+        guard let components = URLComponents(string: urlString), let host = components.host,
+              let address = ServerLocation.plexDirectAddress(host.lowercased()),
+              ServerLocation.isPrivateAddress(address) else { return nil }
+        let literal = address.contains(":") ? "[\(address)]" : address
+        return "http://\(literal):\(components.port ?? 32400)"
+    }
+
+    /// Without plex.tv there is no connection list, so the saved plex.direct URL's own address
+    /// is the only candidate. The server root (not `/identity`, which answers anyone) must
+    /// accept the saved token, so a stranger now at that address is never adopted.
+    private func adoptLANAddressWithoutPlexTV(from currentURL: String) async -> Bool {
+        guard let lanURL = Self.lanFallbackURL(for: currentURL),
+              let token = selectedServerToken ?? authToken,
+              let url = URL(string: "\(lanURL)/") else { return false }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        request.addValue(token, forHTTPHeaderField: "X-Plex-Token")
+        let session = URLSession(configuration: .ephemeral, delegate: PlexCertificateDelegate(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        guard let (_, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
+        AppLog.plexAuth.notice("plex.tv unreachable, using the server's LAN address")
+        selectedServerURL = lanURL
+        userDefaults.set(lanURL, forKey: serverURLKey)
+        isConnected = true
+        connectionError = nil
+        state = .authenticated
+        return true
+    }
+
     /// Test connection and extract plex.direct hash from certificate if it fails
     /// Returns (success, extractedHash) where extractedHash is the plex.direct hash from the cert
     private func testConnectionWithCertExtraction(_ urlString: String, serverToken: String? = nil) async -> (Bool, String?) {
@@ -909,6 +942,7 @@ class PlexAuthManager: ObservableObject {
                 }
             } catch {
                 AppLog.plexAuth.error("Failed to fetch servers for re-selection: \(SensitiveDataRedactor.redact("\(error)"))")
+                if await adoptLANAddressWithoutPlexTV(from: currentURL) { return }
                 // Keep existing credentials - just mark as not connected
                 // User can still see cached content
             }

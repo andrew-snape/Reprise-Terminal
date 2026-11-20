@@ -5,8 +5,8 @@
 //
 //  The playing track's cover: fetched once per album through Plex's photo
 //  transcoder (600 px), handed to Control Centre's Now Playing, and drawn on
-//  the Now Playing screen as Matrix-style text: katakana and digits in shades
-//  of coral, with drops of light falling down it while music plays.
+//  the Now Playing screen as Matrix-style text: katakana and digits in the
+//  cover's own colours, with drops of light falling down it while music plays.
 //
 
 import AppKit
@@ -38,7 +38,7 @@ final class CLIArtwork {
         key = thumb
         image = nil
         mediaArtwork = nil
-        levels = nil
+        cellCache = nil
         version += 1
         guard let thumb,
               let url = PlexNetworkManager.shared.buildThumbnailURL(
@@ -49,24 +49,26 @@ final class CLIArtwork {
             guard key == thumb, let image else { return }  // A failed cover stays a placeholder.
             self.image = image
             mediaArtwork = Self.artwork(image)
-            levels = nil
+            cellCache = nil
             version += 1
             onChange?()
         }
     }
 
-    /// The cover's brightness, one value (0...1, contrast stretched) a cell.
-    private var levels: (cols: Int, rows: Int, values: [Float])?
+    /// The cover cell by cell: brightness (0...1, contrast stretched) and its colour.
+    private var cellCache: (cols: Int, rows: Int, levels: [Float], colours: [RGB])?
+    private typealias RGB = (r: Double, g: Double, b: Double)
 
     /// Katakana (half width, one column each) and digits, as on the Matrix's screens.
     private static let glyphs = Array("ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789Z:=*+<>¦")
     private static let faint = Array(".·:")
 
     /// The cover as `rows` lines of `cols` characters, Matrix style: dark areas
-    /// empty, the rest glyphs whose coral brightness follows the picture. With
-    /// `frame`, glyphs flicker and drops of light fall down the columns.
+    /// empty, the rest glyphs in the cover's own colours, brighter where it is
+    /// brighter. With `frame`, glyphs flicker and drops of light fall down the
+    /// columns, whitening what they pass.
     func lines(cols: Int, rows: Int, frame: Int?) -> [String]? {
-        guard let values = brightness(cols: cols, rows: rows) else { return nil }
+        guard let (levels, colours) = cells(cols: cols, rows: rows) else { return nil }
         let animate = frame != nil
         let frame = frame ?? 0
         var lines: [String] = []
@@ -74,10 +76,11 @@ final class CLIArtwork {
         let cycle = rows + 14
         for y in 0..<rows {
             var line = ""
-            var lastShade = -1
+            var lastColour: (Int, Int, Int)?
             for x in 0..<cols {
                 let seed = Self.hash(x, y)
-                var level = values[y * cols + x]
+                var level = levels[y * cols + x]
+                var glow = 0.0
                 var head = false
                 if animate {
                     // Each column has its own drop: speed, start and trail.
@@ -88,7 +91,10 @@ final class CLIArtwork {
                         .truncatingRemainder(dividingBy: Double(cycle))
                     let behind = position - Double(y)
                     if behind >= 0, behind < 1 { head = true }
-                    if behind >= 0, behind < trail { level += Float(0.45 * (1 - behind / trail)) }
+                    if behind >= 0, behind < trail {
+                        glow = 0.45 * (1 - behind / trail)
+                        level += Float(glow)
+                    }
                 }
                 level = min(1, level)
                 let character: Character
@@ -103,10 +109,12 @@ final class CLIArtwork {
                     let flicker = animate && (seed &+ UInt64(frame)) % 23 == 0 ? UInt64(frame) : 0
                     character = Self.glyphs[Int((seed &+ flicker) % UInt64(Self.glyphs.count))]
                 }
-                let shade = head ? 16 : min(15, Int(level * 15.99))
-                if character != " ", shade != lastShade {
-                    line += Self.shades[shade]
-                    lastShade = shade
+                if character != " " {
+                    let colour = Self.shade(colours[y * cols + x], level: level, whiten: head ? 0.8 : glow * 1.2)
+                    if lastColour.map({ $0 != colour }) ?? true {
+                        line += "\u{1B}[38;2;\(colour.0);\(colour.1);\(colour.2)m"
+                        lastColour = colour
+                    }
                 }
                 line.append(character)
             }
@@ -115,26 +123,25 @@ final class CLIArtwork {
         return lines
     }
 
-    /// Dark coral to the accent to near white, in 16 steps; the 17th lights a drop's head.
-    private static let shades: [String] = {
-        func mix(_ a: (Double, Double, Double), _ b: (Double, Double, Double), _ t: Double) -> String {
-            let r = Int(a.0 + (b.0 - a.0) * t), g = Int(a.1 + (b.1 - a.1) * t), bl = Int(a.2 + (b.2 - a.2) * t)
-            return "\u{1B}[38;2;\(r);\(g);\(bl)m"
+    /// The cell's own colour at a brightness following `level` (thin glyphs on a
+    /// dark screen need it lifted), mixed toward white by `whiten`, in steps of
+    /// 8 so neighbours share an escape code.
+    private static func shade(_ colour: RGB, level: Float, whiten: Double) -> (Int, Int, Int) {
+        let peak = max(colour.r, colour.g, colour.b, 1)
+        let scale = 255 * (0.3 + 0.7 * Double(level)) / peak
+        func channel(_ value: Double) -> Int {
+            let lifted = min(255, value * scale)
+            let mixed = lifted + (255 - lifted) * min(1, whiten)
+            return min(255, Int(mixed) / 8 * 8 + 4)
         }
-        let dark = (60.0, 18.0, 20.0), accent = (255.0, 112.0, 110.0), light = (255.0, 214.0, 208.0)
-        var shades = (0..<16).map { i -> String in
-            let t = Double(i) / 15
-            return t < 0.7 ? mix(dark, accent, t / 0.7) : mix(accent, light, (t - 0.7) / 0.3)
-        }
-        shades.append("\u{1B}[1m\u{1B}[38;2;255;244;240m")
-        return shades
-    }()
+        return (channel(colour.r), channel(colour.g), channel(colour.b))
+    }
 
-    /// A cell's brightness from the cover drawn at one pixel a cell (a cell is
-    /// twice as tall as wide, so a square cover is `2 × rows` cells across).
-    private func brightness(cols: Int, rows: Int) -> [Float]? {
+    /// The cover drawn at one pixel a cell (a cell is twice as tall as wide, so a
+    /// square cover is `2 × rows` cells across): each cell's brightness and colour.
+    private func cells(cols: Int, rows: Int) -> ([Float], [RGB])? {
         guard let image, cols > 0, rows > 0 else { return nil }
-        if let levels, levels.cols == cols, levels.rows == rows { return levels.values }
+        if let cellCache, cellCache.cols == cols, cellCache.rows == rows { return (cellCache.levels, cellCache.colours) }
         var pixels = [UInt8](repeating: 0, count: cols * rows * 4)
         let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
             guard let space = CGColorSpace(name: CGColorSpace.sRGB),
@@ -147,16 +154,17 @@ final class CLIArtwork {
         }
         guard drawn else { return nil }
         // Row 0 of the buffer is the top of the picture.
-        var values = (0..<(cols * rows)).map { i -> Float in
-            (0.2126 * Float(pixels[i * 4]) + 0.7152 * Float(pixels[i * 4 + 1]) + 0.0722 * Float(pixels[i * 4 + 2])) / 255
+        let colours = (0..<(cols * rows)).map { i -> RGB in
+            (Double(pixels[i * 4]), Double(pixels[i * 4 + 1]), Double(pixels[i * 4 + 2]))
         }
+        var levels = colours.map { Float(0.2126 * $0.r + 0.7152 * $0.g + 0.0722 * $0.b) / 255 }
         // Stretch between the 3rd and 97th percentiles, so dull covers still read.
-        let sorted = values.sorted()
+        let sorted = levels.sorted()
         let low = sorted[sorted.count * 3 / 100], high = sorted[min(sorted.count - 1, sorted.count * 97 / 100)]
         let range = max(0.05, high - low)
-        values = values.map { min(1, max(0, ($0 - low) / range)) }
-        levels = (cols, rows, values)
-        return values
+        levels = levels.map { min(1, max(0, ($0 - low) / range)) }
+        cellCache = (cols, rows, levels, colours)
+        return (levels, colours)
     }
 
     /// A fixed scramble of a cell's position, so its glyph is the same each draw.

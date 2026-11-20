@@ -76,6 +76,11 @@ nonisolated struct PlexDevice: Codable, Sendable {
     /// NOT the plex.direct subdomain hash — that lives in each connection's `uri`.
     var machineIdentifier: String?
 
+    /// `provides` is a comma list ("server,client,player" on a server that is also a player).
+    var isServer: Bool {
+        provides.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "server" }
+    }
+
     enum CodingKeys: String, CodingKey {
         case name, product, productVersion, platform, platformVersion, device
         case clientIdentifier, createdAt, lastSeenAt, provides, ownerId
@@ -323,6 +328,8 @@ nonisolated struct PlexMedia: Codable, Sendable {
     let container: String?
     let videoFrameRate: String?
     let Part: [PlexPart]?
+    /// A version the server still lists but whose file is gone (known only after `checkFiles=1`).
+    var isMissing: Bool { Part?.contains { $0.exists == false || $0.accessible == false } == true }
 }
 
 nonisolated struct PlexPart: Codable, Sendable {
@@ -333,6 +340,9 @@ nonisolated struct PlexPart: Codable, Sendable {
     let size: Int?
     let container: String?
     let Stream: [PlexStream]?
+    // Sent only with `checkFiles=1`.
+    var exists: Bool? = nil
+    var accessible: Bool? = nil
 }
 
 nonisolated struct PlexChapter: Codable, Sendable {

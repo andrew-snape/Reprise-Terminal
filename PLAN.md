@@ -9,7 +9,7 @@ In order. Each step ships on its own.
 - **Playlists page** (`P`), **radio** (`r`), **queue editing** (`+` next, `=` end, `x` remove
   on the queue page), **saved queue** on launch, **Now Playing and media keys**,
   **loudness levelling** (`L`).
-- **Now Playing screen** (`v`) with the cover as Matrix-style coral text and rain; the cover in Control Centre.
+- **Now Playing screen** (`v`) with the cover as Matrix-style text in its own colours, and rain; the cover in Control Centre.
 - **Skips fixed**: AVPlayer holds two items, `n` advances onto the queued one, a refused
   file is retried quietly before "Lost <server>".
 
