@@ -95,6 +95,12 @@ Sources/reprise/
   current track only): album `/children` lists lack stream details (bit depth, rate).
 - **Text is measured in terminal columns** (`String.columns`: wide CJK and emoji count
   2), and `fitted` strips control characters, since metadata is untrusted.
+- **Window sizes** (`CLIApp.Layout`): 14+ rows get the gaps and rule; shorter drops them;
+  under 8 rows the track and time share one line; under 4 rows or 24 columns it says
+  "Window too small". Narrow drops the badge word, server, list details (< 40) and
+  quality (< 60); breadcrumbs keep their end; help shows whole hints by priority, with
+  `q quit` always last. List rows stop at 120 columns. Now Playing drops quality and
+  Next when that buys a usable cover, and centres cover + words in wide, short windows.
 - **Window title** is the playing track (OSC 2). The old title is pushed on enter
   (`CSI 22;0t`) and popped on restore (`CSI 23;0t`), after an empty title for terminals
   without a title stack.

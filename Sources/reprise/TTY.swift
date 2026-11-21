@@ -317,6 +317,21 @@ extension String {
         return out + "…"
     }
 
+    /// Clipped from the front to `width` columns, keeping the end (breadcrumbs).
+    func fittedTail(_ width: Int) -> String {
+        guard width > 0 else { return "" }
+        let text = printable
+        if text.columns <= width { return text }
+        var out = ""
+        var used = 0
+        for c in text.reversed() {
+            if used + c.columns > width - 1 { break }
+            out.insert(c, at: out.startIndex)
+            used += c.columns
+        }
+        return "…" + out
+    }
+
     /// Clipped and padded to exactly `width` columns.
     func padded(_ width: Int) -> String {
         let f = fitted(width)
