@@ -679,34 +679,65 @@ final class CLIApp {
 
     // MARK: - Drawing
 
-    private var listHeight: Int { max(1, TTY.size.rows - 7) }
+    /// Where the parts go for a window size. A tall window has room to breathe (a gap
+    /// under the header, a rule over the track, a gap over the help); a short one drops
+    /// those, then folds the progress into the track line, so the list keeps its rows.
+    private struct Layout {
+        let rows: Int, width: Int
+        var roomy: Bool { rows >= 14 }
+        var tiny: Bool { rows < 8 }
+        var tooSmall: Bool { rows < 4 || width < 24 }
+        var top: Int { roomy ? 3 : 2 }
+        var ruleRow: Int? { roomy ? rows - 4 : nil }
+        var trackRow: Int { tiny ? rows - 1 : roomy ? rows - 3 : rows - 2 }
+        var progressRow: Int? { tiny ? nil : roomy ? rows - 2 : rows - 1 }
+        var listHeight: Int { max(1, (ruleRow ?? trackRow) - top) }
+        /// The last row the Now Playing screen may use; the help line is below.
+        var bottom: Int { roomy ? rows - 2 : rows - 1 }
+    }
+
+    private var layout: Layout { Layout(rows: TTY.size.rows, width: TTY.size.cols) }
+    private var listHeight: Int { layout.listHeight }
 
     private func draw() {
         guard !quitting else { return }
-        let (rows, cols) = TTY.size
-        let width = max(20, cols)
+        let layout = self.layout
+        let rows = layout.rows, width = layout.width
         var out = "\u{1B}[?25l"
 
-        // Header: badge, breadcrumb, server.
-        let badge = "\(TTY.accentBG)\(TTY.bold) ◆ REPRISE \(TTY.reset)"
+        if layout.tooSmall {
+            drawnArt = nil
+            out += "\u{1B}[2J"
+            let text = "Window too small".fitted(width)
+            out += TTY.move(row: max(1, (rows + 1) / 2), col: max(1, (width - text.columns) / 2 + 1)) + TTY.dim + text + TTY.reset
+            TTY.write(TTY.frame(out))
+            return
+        }
+
+        // Header: badge, breadcrumb (its end kept), server when there's room.
+        let badge = width >= 50 ? "\(TTY.accentBG)\(TTY.bold) ◆ REPRISE \(TTY.reset)" : "\(TTY.accentBG)\(TTY.bold) ◆ \(TTY.reset)"
+        let badgeWidth = width >= 50 ? 11 : 3
         let crumbs = showingNow ? "Now Playing" : stack.map(\.title).joined(separator: " › ")
-        let server = connection.serverName + (connection.isRelay ? " (relay)" : "")
-        let crumbWidth = max(0, width - 13 - server.columns - 1)
-        out += TTY.move(row: 1) + TTY.clearLine + badge + "  " + TTY.dim + crumbs.fitted(crumbWidth).padded(crumbWidth)
-            + TTY.reset + " " + TTY.dim + server.fitted(max(0, width - 14)) + TTY.reset
-        out += TTY.move(row: 2) + TTY.clearLine
+        let serverName = connection.serverName + (connection.isRelay ? " (relay)" : "")
+        let server = width >= 60 ? serverName.fitted(width / 3) : ""
+        let crumbWidth = max(0, width - badgeWidth - 2 - (server.isEmpty ? 0 : server.columns + 2))
+        out += TTY.move(row: 1) + TTY.clearLine + badge + "  " + TTY.dim + crumbs.fittedTail(crumbWidth).padded(crumbWidth)
+            + TTY.reset + (server.isEmpty ? "" : "  " + TTY.dim + server + TTY.reset)
+        if layout.roomy { out += TTY.move(row: 2) + TTY.clearLine }
 
         if showingNow {
-            drawNowPlaying(&out, rows: rows, width: width)
-            drawFooter(&out, rows: rows, width: width)
+            drawNowPlaying(&out, layout: layout)
+            drawFooter(&out, layout: layout)
             TTY.write(TTY.frame(out))
             return
         }
         drawnArt = nil
 
-        // List.
+        // List. In a very wide window the rows stop at a readable width, so a
+        // year or duration isn't far from its title.
         if stack.last?.kind == .queue, stack.last?.rows.count != player.tracks.count { refreshQueuePage() }
-        let height = max(1, rows - 7)
+        let height = layout.listHeight
+        let listWidth = min(width, 120)
         if var page = stack.last {
             let visible = page.visible
             if page.selected < page.top { page.top = page.selected }
@@ -715,16 +746,16 @@ final class CLIApp {
             stack[stack.count - 1].top = page.top
             let playingKey = player.current?.ratingKey
             for line in 0..<height {
-                out += TTY.move(row: 3 + line) + TTY.clearLine
+                out += TTY.move(row: layout.top + line) + TTY.clearLine
                 let v = page.top + line
                 guard visible.indices.contains(v) else { continue }
                 let row = page.rows[visible[v]]
                 let isSelected = v == page.selected
                 let isPlaying = playingKey != nil && row.item?.ratingKey == playingKey
                 let marker = isPlaying ? "\(TTY.pink)♪\(TTY.reset)" : " "
-                let detail = row.detail.fitted(max(0, width / 3))
+                let detail = listWidth >= 40 ? row.detail.fitted(listWidth / 3) : ""
                 let detailWidth = detail.columns
-                let titleWidth = max(4, width - 6 - detailWidth)
+                let titleWidth = max(4, listWidth - 6 - detailWidth)
                 let title = row.title.fitted(titleWidth)
                 let titlePad = String(repeating: " ", count: max(0, titleWidth - title.columns))
                 if isSelected {
@@ -734,67 +765,94 @@ final class CLIApp {
                 }
             }
             if visible.isEmpty, !loading {
-                out += TTY.move(row: 3) + "   \(TTY.dim)Nothing here\(page.filter.isEmpty ? "" : " matches “\(page.filter)”").\(TTY.reset)"
+                let note = "Nothing here" + (page.filter.isEmpty ? "" : " matches “\(page.filter)”") + "."
+                out += TTY.move(row: layout.top) + "   \(TTY.dim)\(note.fitted(width - 4))\(TTY.reset)"
             }
         } else {
-            for line in 0..<height { out += TTY.move(row: 3 + line) + TTY.clearLine }
+            for line in 0..<height { out += TTY.move(row: layout.top + line) + TTY.clearLine }
         }
 
         // Now playing.
-        let rule = TTY.dim + String(repeating: "─", count: width) + TTY.reset
-        out += TTY.move(row: rows - 4) + TTY.clearLine + rule
-        out += TTY.move(row: rows - 3) + TTY.clearLine
-        out += TTY.move(row: rows - 2) + TTY.clearLine
+        if let ruleRow = layout.ruleRow {
+            out += TTY.move(row: ruleRow) + TTY.clearLine + TTY.dim + String(repeating: "─", count: width) + TTY.reset
+        }
+        for row in layout.trackRow..<rows { out += TTY.move(row: row) + TTY.clearLine }
         if let track = player.current {
-            let quality = player.quality(of: track)
-            let line = "\(track.title ?? "Untitled")"
-            let sub = [track.grandparentTitle, track.parentTitle].compactMap { $0 }.joined(separator: " · ")
-            let left = max(0, width - quality.columns - 6)
-            let titleText = line.fitted(left)
-            let subText = sub.isEmpty ? "" : (" — " + sub).fitted(max(0, left - titleText.columns))
-            let pad = String(repeating: " ", count: max(0, left - titleText.columns - subText.columns))
-            out += TTY.move(row: rows - 3) + " \(TTY.pink)♪\(TTY.reset) \(TTY.bold)\(titleText)\(TTY.reset)\(TTY.dim)\(subText)\(TTY.reset)\(pad)  \(TTY.dim)\(quality)\(TTY.reset)"
-
             let spin = ["◐", "◓", "◑", "◒"][spinner % 4]
             let icon = player.isWaiting ? spin : player.isPlaying ? "▶" : "⏸"
             let elapsed = formatTime(player.time), total = formatTime(player.duration)
-            let bar = progressBar(width: max(4, width - elapsed.count - total.count - 9))
-            out += TTY.move(row: rows - 2) + " \(TTY.accent)\(icon)\(TTY.reset) \(elapsed) \(bar) \(total)"
+            let line = "\(track.title ?? "Untitled")"
+            let sub = [track.grandparentTitle, track.parentTitle].compactMap { $0 }.joined(separator: " · ")
+            if layout.tiny {
+                // One line: state, time, then the track.
+                let time = "\(elapsed) / \(total)"
+                let left = max(0, width - time.count - 6)
+                let titleText = line.fitted(left)
+                let subText = sub.isEmpty ? "" : (" — " + sub).fitted(max(0, left - titleText.columns))
+                out += TTY.move(row: layout.trackRow) + " \(TTY.accent)\(icon)\(TTY.reset) \(TTY.dim)\(time)\(TTY.reset)  \(TTY.bold)\(titleText)\(TTY.reset)\(TTY.dim)\(subText)\(TTY.reset)"
+            } else {
+                let quality = width >= 60 ? player.quality(of: track) : ""
+                let left = max(0, width - quality.columns - 6)
+                let titleText = line.fitted(left)
+                let subText = sub.isEmpty ? "" : (" — " + sub).fitted(max(0, left - titleText.columns))
+                let pad = String(repeating: " ", count: max(0, left - titleText.columns - subText.columns))
+                out += TTY.move(row: layout.trackRow) + " \(TTY.pink)♪\(TTY.reset) \(TTY.bold)\(titleText)\(TTY.reset)\(TTY.dim)\(subText)\(TTY.reset)\(pad)  \(TTY.dim)\(quality)\(TTY.reset)"
+                let bar = progressBar(width: max(4, width - elapsed.count - total.count - 9))
+                out += TTY.move(row: layout.progressRow ?? rows - 1) + " \(TTY.accent)\(icon)\(TTY.reset) \(elapsed) \(bar) \(total)"
+            }
         } else {
-            out += TTY.move(row: rows - 3) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
+            out += TTY.move(row: layout.trackRow) + "   \(TTY.dim)Nothing playing\(TTY.reset)"
         }
-        drawFooter(&out, rows: rows, width: width)
+        drawFooter(&out, layout: layout)
         TTY.write(TTY.frame(out))
     }
 
-    /// The window title, and the last two lines: help, the ask or filter prompt, or a message.
-    private func drawFooter(_ out: inout String, rows: Int, width: Int) {
+    /// The window title, and the last line: help, the ask or filter prompt, or a message.
+    private func drawFooter(_ out: inout String, layout: Layout) {
+        let rows = layout.rows, width = layout.width
         if let track = player.current {
             TTY.setTitle("\(player.isPlaying ? "♪" : "⏸") \(track.title ?? "Untitled")" + (track.grandparentTitle.map { " — \($0)" } ?? ""))
         } else {
             TTY.setTitle("Reprise")
         }
 
-        // Help, filter or status.
-        out += TTY.move(row: rows - 1) + TTY.clearLine
+        // Help, filter or status. The key hints on the prompts go first when narrow.
+        if layout.roomy { out += TTY.move(row: rows - 1) + TTY.clearLine }
         out += TTY.move(row: rows) + TTY.clearLine
         if asking {
             let name = CLIAsk.isAvailable ? "ask" : "search"
-            out += " \(TTY.accent)✦ \(name) ›\(TTY.reset) \(askText.fitted(max(1, width - 30)))\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ go  esc cancel\(TTY.reset)"
+            let hints = width >= 50 ? "  \(TTY.dim)⏎ go  esc cancel\(TTY.reset)" : ""
+            out += " \(TTY.accent)✦ \(name) ›\(TTY.reset) \(askText.fittedTail(max(1, width - name.count - 6 - hints.columns)))\(TTY.accent)▏\(TTY.reset)\(hints)"
         } else if filtering, let page = stack.last {
-            out += " \(TTY.accent)/\(TTY.reset) \(page.filter.fitted(max(1, width - 20)))\(TTY.accent)▏\(TTY.reset)  \(TTY.dim)⏎ open  esc clear\(TTY.reset)"
+            let hints = width >= 40 ? "  \(TTY.dim)⏎ open  esc clear\(TTY.reset)" : ""
+            out += " \(TTY.accent)/\(TTY.reset) \(page.filter.fittedTail(max(1, width - 5 - hints.columns)))\(TTY.accent)▏\(TTY.reset)\(hints)"
         } else if let status, Date() < statusUntil {
             out += " \(TTY.pink)\(status.fitted(width - 2))\(TTY.reset)"
         } else if loading {
-            out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)\(loadingText)\(TTY.reset)"
+            out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)\(loadingText.fitted(width - 4))\(TTY.reset)"
         } else if showingNow {
-            let help = "space pause  n/p next/prev  ,/. seek  r radio  : ask  tab queue  L levelling  ← back  q quit"
-            out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
+            let help = ["space pause", "n/p next/prev", ",/. seek", "← back", ": ask", "r radio", "tab queue", "L levelling"]
+            out += " " + TTY.dim + Self.hints(help, width: width - 2) + TTY.reset
         } else {
-            let queueKeys = stack.last?.kind == .queue ? "x remove  " : ""
-            let help = "⏎ open  ← back  : ask  / filter  a play  s shuffle  r radio  +/= queue  \(queueKeys)space pause  n/p next/prev  ,/. seek  v now playing  tab queue  P playlists  L levelling  q quit"
-            out += " " + TTY.dim + help.fitted(width - 2) + TTY.reset
+            var help = ["⏎ open", "← back", "space pause", ": ask", "/ filter", "n/p next/prev", "a play", "s shuffle",
+                        "v now playing", "tab queue", "r radio", "+/= queue", ",/. seek", "P playlists", "L levelling"]
+            if stack.last?.kind == .queue { help.insert("x remove", at: 3) }
+            out += " " + TTY.dim + Self.hints(help, width: width - 2) + TTY.reset
         }
+    }
+
+    /// Whole key hints, most useful first, as many as fit, and always "q quit" last.
+    private static func hints(_ items: [String], width: Int) -> String {
+        let quit = "q quit"
+        var shown: [String] = []
+        var used = quit.columns
+        for item in items {
+            let cost = item.columns + 2
+            guard used + cost <= width else { break }
+            shown.append(item)
+            used += cost
+        }
+        return (shown + [quit]).joined(separator: "  ").fitted(width)
     }
 
     private func progressBar(width barWidth: Int) -> String {
@@ -809,27 +867,38 @@ final class CLIApp {
     /// The cover, large, with the track under it (or beside it in a wide, short
     /// window). The cover is redrawn only when it, the layout or the rain's frame
     /// changes; paused, it isn't sent again.
-    private func drawNowPlaying(_ out: inout String, rows: Int, width: Int) {
-        let top = 3
-        let available = max(0, rows - 4)  // Rows 3 to rows - 2; the footer is below.
+    private func drawNowPlaying(_ out: inout String, layout: Layout) {
+        let rows = layout.rows, width = layout.width
+        let top = layout.top
+        let available = max(0, layout.bottom - top + 1)  // The help line is below.
         let track = player.current
-        let textHeight = 6
         let side = width >= 2 * available + 40
-        let artRows = side ? available : max(0, min(available - textHeight - 1, (width - 4) / 2))
+        func coverRows(_ textHeight: Int) -> Int {
+            side ? available : max(0, min(available - textHeight - 1, (width - 4) / 2))
+        }
+        // A short window keeps just the title, artist and progress, if that buys a
+        // usable cover (or the six lines don't fit at all).
+        let fullCover = coverRows(6), shortCover = coverRows(3)
+        let compact = side ? available < 6
+            : shortCover >= 4 && fullCover < 8 && shortCover > fullCover ? true
+            : fullCover < 4 && available < 6
+        let textHeight = compact ? 3 : 6
+        let artRows = compact ? shortCover : fullCover
         let showArt = track != nil && artRows >= 4
         let artCols = artRows * 2
-        let artCol = side ? 3 : max(1, (width - artCols) / 2 + 1)
+        // Beside the words, the pair is centred across a very wide window.
+        let artCol = side ? max(3, (width - artCols - 4 - 64) / 2 + 1) : max(1, (width - artCols) / 2 + 1)
         let block = showArt ? (side ? artRows : artRows + 1 + textHeight) : textHeight
         let artTop = top + max(0, (available - block) / 2)
 
         // The rain falls only while music plays; paused, the cover holds still.
         let frame = player.isPlaying && !player.isWaiting ? rainFrame : nil
-        let layout = "\(TTY.light)|\(artwork.key ?? "-")|\(artwork.isLoaded)|\(showArt)|\(artRows)|\(artCol)|\(artTop)|\(rows)x\(width)"
-        let key = layout + "|\(frame ?? 0)"
+        let artLayout = "\(TTY.light)|\(artwork.key ?? "-")|\(artwork.isLoaded)|\(showArt)|\(artRows)|\(artCol)|\(artTop)|\(rows)x\(width)"
+        let key = artLayout + "|\(frame ?? 0)"
         if key != drawnArt {
             // A new layout clears the screen; a new frame just writes over the cover.
-            if drawnArt?.hasPrefix(layout + "|") != true {
-                for row in top..<(rows - 1) { out += TTY.move(row: row) + TTY.clearLine }
+            if drawnArt?.hasPrefix(artLayout + "|") != true {
+                for row in top...max(top, layout.bottom) { out += TTY.move(row: row) + TTY.clearLine }
             }
             drawnArt = key
             if showArt {
@@ -880,7 +949,7 @@ final class CLIApp {
             return (style + fit + TTY.reset, fit.columns)
         }
         let progressPlain = 2 + elapsed.count + 1 + max(4, barSpace - elapsed.count - total.count - 4) + 1 + total.count
-        let lines: [(String, Int)] = [
+        var lines: [(String, Int)] = [
             plain(track.title ?? "Untitled", TTY.bold),
             plain(sub, TTY.dim),
             ("", 0),
@@ -890,9 +959,10 @@ final class CLIApp {
                 plain("Next: " + (next.title ?? "Untitled") + (next.grandparentTitle.map { " · \($0)" } ?? ""), TTY.dim)
             } ?? ("", 0)
         ]
+        if compact { lines = [lines[0], lines[1], lines[3]] }
         for (i, line) in lines.enumerated() {
             let row = textTop + i
-            guard row < rows - 1 else { break }
+            guard row <= layout.bottom else { break }
             if side && showArt {
                 out += TTY.move(row: row, col: textCol) + "\u{1B}[K" + line.0
             } else {
