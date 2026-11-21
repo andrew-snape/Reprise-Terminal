@@ -383,8 +383,7 @@ final class CLIApp {
         case .tab: toggleQueue()
         case .char("v"):
             guard player.current != nil else { flash("Nothing playing yet."); return }
-            showingNow = true
-            drawnArt = nil
+            showNowPlaying()
         default: break
         }
         artwork.want(player.current, connection: connection)
@@ -482,7 +481,15 @@ final class CLIApp {
         } else {
             player.play(tracks, from: 0)
         }
+        showNowPlaying()
         flash("▶ \(label)")
+    }
+
+    /// Starting music opens the Now Playing screen; ← or v goes back to the list.
+    private func showNowPlaying() {
+        guard player.current != nil else { return }
+        showingNow = true
+        drawnArt = nil
     }
 
     // MARK: - Playlists, radio, queue
@@ -597,8 +604,10 @@ final class CLIApp {
             }
         case .tracks:
             player.play(page.rows.compactMap(\.item), from: index)
+            showNowPlaying()
         case .queue:
             player.play(player.tracks, from: index)
+            showNowPlaying()
         case .playlists:
             guard let playlist = row.item else { return }
             load { [self] in
@@ -639,6 +648,7 @@ final class CLIApp {
             } else {
                 player.play(tracks, from: page.kind == .queue ? index : 0)
             }
+            showNowPlaying()
             return
         }
         guard let item = selected?.row.item ?? (action == .radio ? player.current : nil) else { return }

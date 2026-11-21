@@ -172,7 +172,8 @@ Sources/reprise/
 - **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
   metadata (album gain when one album plays in order), set on the player when a track starts
   (the next item's on `didPlayToEndTime`, so no loud first moment).
-- **Now Playing screen** (`v`): the cover as Matrix-style text, one cell a pixel (a square
+- **Now Playing screen** (`v`, and opened whenever music is started: a track, `a`, `s`,
+  `r` or ask; not queueing, pause or skips): the cover as Matrix-style text, one cell a pixel (a square
   cover is `2 × rows` cells across): half-width katakana (one column each) and digits in
   the cover's own colour per cell, lifted by brightness (contrast stretched) since thin glyphs read darker; the one place outside coral and pink (contrast stretched), dark areas empty. While music
   plays a 0.12 s timer moves drops of light (whitening the colour) down the columns and flickers a few glyphs;
