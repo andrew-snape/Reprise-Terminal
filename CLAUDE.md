@@ -123,6 +123,31 @@ Sources/reprise/
   matches nothing for tracks; verified Nov 2026). Moods are dropped first, then years,
   when nothing matches. Without Apple Intelligence it is a keyword search. Try requests
   with the hidden `reprise --ask "<text>"`.
+  - **An artist with a genre, mood or years** ("mellow radiohead", "green day from the
+    2000s") is that artist's `getRandomTracks` with `artist.id` plus the filters; words of
+    the names don't count as tags ("kid rock" is not rock), and a mood or genre named
+    plainly is added when the model misses it. With the artist as anchor, moods, then
+    years, then genres are dropped until something matches; the label says what was dropped.
+  - **Everyday mood words** (`moodWords`: "chill", "upbeat", "party", and "sad", "happy",
+    "dark" widened to their neighbours, since track moods are sparse) map to several
+    AllMusic moods (Plex reads a list as any of them); the label shows the typed word.
+    The model often returns moods outside the list ("Chill", "Upbeat"), and sometimes a
+    year nobody asked for ("something chill": 2026), so its years are kept only when the
+    words mention a time (`mentionsTime`).
+  - With an artist named, a title that is also one of the model's moods is the mood when
+    songs in general are asked for ("sad nick cave songs"); otherwise the title is tried
+    first and the mood only if no song or album wins ("play happy by pharrell"). A named
+    request that finds nothing at all ("kid a" read as song "a") falls back to keyword search.
+  - **About the playing track** (`PlayingReference`, read by pattern before the model, so
+    it works without Apple Intelligence and "This Is Acting" stays a title): "more like
+    this" / "this song" with radio is radio from it, "this album" and "this artist" act
+    on its album or artist. Radio from the playing track keeps it playing and replaces
+    what follows (`CLIPlayer.replaceUpcoming`): loading it afresh would ask Plex for a
+    file this session is reading. `r` on Now Playing goes the same way.
+  - **History**: the last 20 requests, `reprise-cli/asks.json` (0600); ↑ ↓ in the prompt.
+  - **`reprise <request>`**: any non-flag arguments are a request, asked once the library
+    loads, in the full-screen app (never headless). The saved queue is picked up only if
+    nothing played.
 - **Saved queue**: `reprise-cli/queue.json` (rating keys, index, time, server id), written
   on track change, pause, queue edits and quit, deleted when the queue plays out; on launch
   it comes back paused (batched `/library/metadata/k1,k2,…`) but **nothing is loaded into

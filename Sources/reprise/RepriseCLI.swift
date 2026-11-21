@@ -35,6 +35,7 @@ enum RepriseCLI {
             reprise: Plex music in your terminal
 
               reprise              browse and play
+              reprise <request>    play what you ask for, e.g. reprise mellow radiohead
               reprise --server     choose a different server
               reprise --sign-out   forget this Mac's Plex sign-in
             """)
@@ -51,10 +52,18 @@ enum RepriseCLI {
             dispatchMain()
         }
 
+        // Anything that isn't a flag is a request to play, asked once the library loads.
+        if let unknown = arguments.first(where: { $0.hasPrefix("-") && $0 != "--server" }) {
+            print("reprise: unknown option \(unknown). See reprise --help.")
+            exit(2)
+        }
+        let request = arguments.filter { $0 != "--server" }.joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+
         Task {
             do {
                 let connection = try await CLISignIn.connect(chooseServer: chooseServer)
-                let app = CLIApp(connection: connection)
+                let app = CLIApp(connection: connection, request: request.isEmpty ? nil : request)
                 Self.app = app
                 await app.run()
             } catch {
@@ -86,6 +95,7 @@ extension RepriseCLI {
             if let request = CLIAsk.lastRequest { print("Read as:", request) }
             print(String(format: "%.1f s", Date().timeIntervalSince(start)))
             print(result.label, "·", result.action)
+            if let note = result.note { print(note) }
             for t in result.tracks.prefix(10) {
                 print("  ♪", t.title ?? "?", "—", t.grandparentTitle ?? "", "·", t.parentTitle ?? "")
             }

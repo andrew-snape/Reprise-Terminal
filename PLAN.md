@@ -15,12 +15,16 @@ In order. Each step ships on its own.
 
 - **Terminal modes**: synchronized output, bracketed paste into the prompts, light
   backgrounds (OSC 11, asked again on focus in).
+- **Ask, more**: artist plus genre, mood or years ("mellow radiohead"); "more like this",
+  "this album", "this artist" from the playing track; request history (↑ ↓, kept between
+  runs); `reprise <request>` starts the app playing it; everyday mood words ("chill",
+  "upbeat"). Radio or an album from the playing track keeps it playing (tested Nov 2026).
 
 ## Next
 
 - Verify in a real terminal: Now Playing from a bare CLI, the slow-start swap, levelling.
-- Ask: artist plus genre or mood ("mellow radiohead"), "more like this" from the playing
-  track, and remembering the last few requests (up arrow in the prompt).
+- Ask: "recent" and "classic" don't become years yet; artists split across names
+  ("Nick Cave" and "Nick Cave & the Bad Seeds") are searched as one only by luck.
 - Playlists come back twice when the account has two music libraries: show the section.
 
 ## Decided

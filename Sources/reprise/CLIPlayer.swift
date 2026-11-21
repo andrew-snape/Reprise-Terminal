@@ -262,6 +262,24 @@ final class CLIPlayer {
         saveState()
     }
 
+    /// Keeps the current track playing and puts `list` after it in place of the
+    /// rest (radio from what is playing). Loading the playing track afresh would
+    /// ask Plex for a file this session is already reading. With nothing playing,
+    /// the list simply plays.
+    func replaceUpcoming(with list: [PlexMetadata]) {
+        guard let index else {
+            play(list, from: 0)
+            return
+        }
+        tracks = Array(tracks[...index]) + list
+        prefersAlbumGain = false
+        if restoredAt == nil {
+            dropQueued()
+            topUp()
+        }
+        saveState()
+    }
+
     /// Takes a track out of the queue; removing the playing one moves to the next.
     func remove(at i: Int) {
         guard tracks.indices.contains(i) else { return }

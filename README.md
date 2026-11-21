@@ -43,6 +43,7 @@ If your account has more than one server, it asks which one to use. It remembers
 
 ```
 reprise              browse and play
+reprise <request>    start playing what you ask for: reprise mellow radiohead
 reprise --server     choose a different server
 reprise --sign-out   forget this Mac's Plex sign-in
 ```
@@ -55,7 +56,7 @@ reprise --sign-out   forget this Mac's Plex sign-in
 | ⏎, → or l | Open, or play from this track |
 | ←, esc or h | Back |
 | / | Filter the list as you type (⏎ opens the selection, esc clears) |
-| : | Ask: "play ghosteen", "some mellow 90s rock", "queue ok computer" |
+| : | Ask: "play ghosteen", "some mellow 90s rock", "mellow radiohead", "more like this", "queue this album". ↑ ↓ bring back earlier requests |
 | a / s | Play / shuffle the selection, or the track list showing |
 | r | Radio: similar music from the selection (or what's playing) |
 | + / = | Play the selection next / add it to the end of the queue |
@@ -78,7 +79,8 @@ reprise --sign-out   forget this Mac's Plex sign-in
 - An album plays gaplessly.
 - Ask uses Apple Intelligence on the Mac to understand the request, and Plex to find the
   music; without Apple Intelligence it is a keyword search. Nothing leaves the Mac but the
-  search itself, sent to your Plex server.
+  search itself, sent to your Plex server. The last 20 requests are kept in
+  `~/Library/Application Support/reprise-cli/asks.json`, readable only by you.
 - Loudness levelling uses Plex's own loudness analysis, so quiet and loud albums sit
   together. It only ever turns music down.
 - The queue is saved when you quit and comes back, paused, next time.

@@ -69,6 +69,8 @@ struct AskResult {
     var tracks: [PlexMetadata] = []
     /// Candidates to pick from when nothing clearly won.
     var choices: [PlexMetadata] = []
+    /// Said instead of "nothing found" when there is nothing to act on.
+    var note: String?
 }
 
 // MARK: - Ask
@@ -97,9 +99,15 @@ enum CLIAsk {
         return session
     }
 
+    /// `playing` is the current track, for requests about it ("more like this").
     static func run(_ text: String, session: LanguageModelSession?, connection: CLIConnection,
-                    section: String) async throws -> AskResult {
+                    section: String, playing: PlexMetadata? = nil) async throws -> AskResult {
         let text = text.trimmingCharacters(in: .whitespaces)
+        // Read here, not by the model: it works without Apple Intelligence, and a
+        // title such as "This Is Acting" is never taken for the playing track.
+        if let reference = PlayingReference(text) {
+            return try await aboutPlaying(reference, playing: playing, connection: connection, section: section)
+        }
         var request: PlayRequest?
         if let session {
             request = try? await session.respond(
@@ -114,10 +122,43 @@ enum CLIAsk {
         request.album = grounded(request.album, in: text)
         request.track = grounded(request.track, in: text)
         request.playlist = grounded(request.playlist, in: text)
+        // A mood or genre the model also took for a title, with an artist named: "sad
+        // nick cave songs" (song "sad") is a mood, "play happy by pharrell" a song. Said
+        // of songs in general it is the mood; otherwise the title is tried first.
+        var asMood: PlayRequest?
+        if request.artist.nonBlank != nil {
+            let tags = request.moods + request.genres
+            func isTag(_ name: String?) -> Bool {
+                guard let name = name.nonBlank else { return false }
+                return tags.contains { similarity($0, name) >= 0.85 }
+            }
+            if isTag(request.track) || isTag(request.album) {
+                var mood = request
+                if isTag(mood.track) { mood.track = nil }
+                if isTag(mood.album) { mood.album = nil }
+                if mood.track.nonBlank == nil, mood.album.nonBlank == nil { mood.kind = .artist }
+                let general: Set<String> = ["songs", "tracks", "music", "stuff", "tunes"]
+                if normalized(text).split(separator: " ").contains(where: { general.contains(String($0)) }) {
+                    request = mood
+                } else {
+                    asMood = mood
+                }
+            }
+        }
 
         let named = [request.artist, request.album, request.track, request.playlist].contains { !($0 ?? "").isBlank }
         if named {
-            return try await byName(request, text: text, connection: connection, section: section)
+            var found = try await byName(request, text: text, connection: connection, section: section)
+            if found.tracks.isEmpty, let asMood {
+                let mood = try await byName(asMood, text: text, connection: connection, section: section)
+                if !mood.tracks.isEmpty { found = mood }
+            }
+            // A name split badly ("kid a" read as song "a") finds nothing at all: the plain words may.
+            if found.tracks.isEmpty, found.choices.isEmpty {
+                let plain = try await keywordSearch(text, action: request.action, connection: connection, section: section)
+                if !plain.tracks.isEmpty || !plain.choices.isEmpty { return plain }
+            }
+            return found
         }
         if let result = try await byDescription(request, text: text, connection: connection, section: section) {
             return result
@@ -141,6 +182,7 @@ enum CLIAsk {
             "90s rock": action play, kind anything, genres ["Pop/Rock"], fromYear 1990, toYear 1999.
             "queue my road trip playlist": action queue, kind playlist, playlist "road trip".
             "radio like ok computer": action radio, kind album, album "ok computer".
+            "mellow radiohead": action play, kind artist, artist "radiohead", moods ["Laid-Back/Mellow"].
             """
     }
 
@@ -212,15 +254,33 @@ enum CLIAsk {
             return result
         }
         result.label = "\(label(for: winner))"
-        // An artist and a time ("green day from the 90s"): that artist's tracks from then.
-        let years = request.fromYear != nil || request.toYear != nil ? (request.fromYear, request.toYear)
-            : decade(in: text).map { (Optional($0), Optional($0 + 9)) } ?? (nil, nil)
-        if winner.type == "artist", years.0 != nil || years.1 != nil, let key = winner.ratingKey {
-            result.tracks = try await randomTracks(genres: [], moods: [], from: years.0, to: years.1,
-                                                   extra: [URLQueryItem(name: "artist.id", value: key)],
-                                                   connection: connection, section: section)
-            result.label += " · " + [years.0.map(String.init), years.1.map(String.init)].compactMap { $0 }.joined(separator: "–")
-            return try await finish(result, connection: connection)
+        // An artist with a genre, mood or time ("mellow radiohead", "green day from the
+        // 90s"): that artist's tracks that fit. Words of the names don't count as
+        // genres or moods ("kid rock" is not rock).
+        if winner.type == "artist", let key = winner.ratingKey {
+            let nameWords = Set([request.artist, request.album, request.track].compactMap { $0 }
+                .flatMap { normalized($0).split(separator: " ").map(String.init) })
+            let rest = normalized(text).split(separator: " ").map(String.init).filter { !nameWords.contains($0) }
+            var wanted = await wanted(request, text: rest.joined(separator: " "), connection: connection, section: section)
+            // Only the name and command words ("play radiohead"): a mood the model
+            // implied comes from what it knows of the artist, not the request.
+            let command: Set<String> = ["play", "shuffle", "radio", "queue", "add", "some", "me", "my", "by",
+                                        "songs", "song", "tracks", "music", "artist", "band", "please", "next"]
+            if rest.allSatisfy(command.contains) { wanted.moods = []; wanted.groups = [] }
+            if !wanted.isEmpty {
+                let asked = wanted.parts
+                let found = try await filteredTracks(&wanted, artist: key, connection: connection, section: section)
+                if !found.isEmpty {
+                    result.tracks = found
+                    if !wanted.isEmpty { result.label += " · " + wanted.parts.joined(separator: " · ") }
+                    let dropped = asked.filter { !wanted.parts.contains($0) }
+                    if !dropped.isEmpty { result.label += " (none \(dropped.joined(separator: ", ")))" }
+                    return try await finish(result, connection: connection)
+                }
+                result.label += " (none \(asked.joined(separator: ", ")))"
+            } else if !wanted.unknown.isEmpty {
+                result.label += " (no “\(wanted.unknown.joined(separator: ", ").lowercased())” in this library)"
+            }
         }
         result.tracks = try await tracks(of: winner, action: request.action, connection: connection, section: section)
         return try await finish(result, connection: connection)
@@ -290,56 +350,145 @@ enum CLIAsk {
 
     // MARK: - By description
 
-    private static func byDescription(_ request: PlayRequest, text: String, connection: CLIConnection,
-                                      section: String) async throws -> AskResult? {
+    /// The genres, moods and years a request asks for, as the library's own tags.
+    private struct Wanted {
+        var genres: [PlexGenre] = []
+        var moods: [PlexGenre] = []
+        var from: Int?
+        var to: Int?
+        /// Typed words the model took for a mood or genre this library doesn't have.
+        var unknown: [String] = []
+        /// Everyday words standing for several moods ("chill"), shown as typed.
+        var groups: [(word: String, moods: [PlexGenre])] = []
+
+        var isEmpty: Bool { genres.isEmpty && moods.isEmpty && from == nil && to == nil }
+
+        /// For labels: "Pop/Rock · Laid-Back/Mellow · 1990–1999".
+        var parts: [String] {
+            let grouped = Set(groups.flatMap { $0.moods.map(\.key) })
+            var parts = genres.map(\.title) + moods.filter { !grouped.contains($0.key) }.map(\.title)
+                + groups.map(\.word)
+            switch (from, to) {
+            case let (from?, to?): parts.append(from == to ? "\(from)" : "\(from)–\(to)")
+            case let (from?, nil): parts.append("From \(from)")
+            case let (nil, to?): parts.append("Up to \(to)")
+            case (nil, nil): break
+            }
+            return parts
+        }
+    }
+
+    /// Genres must be named in `text` ("90s rock"); moods may be implied ("chill").
+    /// Words the model made up are dropped, so the filter stays honest; a tag the
+    /// model missed but the words name plainly ("mellow") is added.
+    private static func wanted(_ request: PlayRequest, text: String, connection: CLIConnection,
+                               section: String) async -> Wanted {
         let (genres, moods) = await libraryTags(connection: connection, section: section)
         let typedWords = Set(normalized(text).split(separator: " ").map(String.init))
-        // Genres must also be named in the request ("90s rock"); moods may be implied
-        // ("chill"). Words the model made up are dropped, so the filter stays honest.
-        var wantedGenres = unique(request.genres.compactMap { tag($0, in: genres) }
+        func named(_ tag: PlexGenre) -> Bool {
+            tag.title.split(separator: "/").contains { typedWords.contains(normalized(String($0))) }
+        }
+        var wanted = Wanted()
+        wanted.genres = unique(request.genres.compactMap { tag($0, in: genres) }
             .filter { genre in genre.title.split(separator: "/").contains { grounded(String($0), in: text) != nil } })
-        if wantedGenres.isEmpty {
-            // What the model missed but the words say plainly: a genre's own name.
-            wantedGenres = genres.values.filter { genre in
-                genre.title.split(separator: "/").contains { typedWords.contains(normalized(String($0))) }
-            }.sorted { $0.title < $1.title }
+        if wanted.genres.isEmpty {
+            wanted.genres = genres.values.filter(named).sorted { $0.title < $1.title }
         }
-        var wantedMoods = unique(request.moods.compactMap { tag($0, in: moods) })
-        var fromYear = request.fromYear, toYear = request.toYear
-        if fromYear == nil, toYear == nil, let decade = decade(in: text) {
-            fromYear = decade
-            toYear = decade + 9
+        wanted.moods = unique(request.moods.compactMap { tag($0, in: moods) })
+        wanted.unknown = (request.moods.filter { tag($0, in: moods) == nil }
+                          + request.genres.filter { tag($0, in: genres) == nil })
+            .filter { grounded($0, in: text) != nil }
+        if wanted.moods.isEmpty {
+            wanted.moods = moods.values.filter(named).sorted { $0.title < $1.title }
         }
-        guard !wantedGenres.isEmpty || !wantedMoods.isEmpty || fromYear != nil || toYear != nil else { return nil }
+        // Everyday words that aren't the library's moods ("chill", "upbeat").
+        let everyday = Set(request.moods.map { normalized($0) } + typedWords).filter { moodWords[$0] != nil }
+        for word in everyday.sorted() {
+            let found = unique(moodWords[word]!.compactMap { moods[$0.lowercased()] })
+            guard !found.isEmpty else { continue }
+            wanted.groups.append((word, found))
+            wanted.moods = unique(wanted.moods + found)
+            wanted.unknown.removeAll { normalized($0) == word }
+        }
+        // The model sometimes fills in this year unasked ("something chill": 2026).
+        if mentionsTime(text) {
+            wanted.from = request.fromYear
+            wanted.to = request.toYear
+        }
+        if wanted.from == nil, wanted.to == nil, let decade = decade(in: text) {
+            wanted.from = decade
+            wanted.to = decade + 9
+        }
+        return wanted
+    }
 
-        // Moods are the softest part of a request: dropped first when nothing matches, then years.
-        var tracks: [PlexMetadata] = []
+    /// Everyday words for moods, as the AllMusic moods Plex libraries carry; those a
+    /// library lacks are skipped. Plex reads a list of moods as any of them.
+    private static let moodWords: [String: [String]] = [
+        // Track moods are sparse, so the plain ones reach their neighbours too.
+        "sad": ["Sad", "Melancholy", "Somber", "Bleak", "Gloomy", "Regretful"],
+        "happy": ["Happy", "Cheerful", "Joyous", "Gleeful", "Optimistic"],
+        "angry": ["Angry", "Aggressive", "Hostile", "Outraged"],
+        "dark": ["Dark", "Brooding", "Ominous", "Menacing"],
+        "mellow": ["Laid-Back/Mellow", "Relaxed", "Calm/Peaceful"],
+        "calm": ["Calm/Peaceful", "Relaxed", "Soothing"],
+        "chill": ["Laid-Back/Mellow", "Relaxed", "Calm/Peaceful"],
+        "chilled": ["Laid-Back/Mellow", "Relaxed", "Calm/Peaceful"],
+        "relaxing": ["Relaxed", "Calm/Peaceful", "Soothing"],
+        "upbeat": ["Lively", "Energetic", "Cheerful", "Bouncy"],
+        "party": ["Fun", "Celebratory", "Exuberant", "Rowdy"],
+        "workout": ["Energetic", "Driving", "Powerful"],
+        "sleep": ["Soothing", "Calm/Peaceful", "Soft/Quiet"],
+        "focus": ["Meditative", "Calm/Peaceful", "Atmospheric"],
+        "moody": ["Brooding", "Melancholy"],
+        "depressing": ["Melancholy", "Bleak", "Gloomy"],
+        "love": ["Romantic", "Tender"],
+        "loud": ["Aggressive", "Raucous", "Explosive"],
+        "quiet": ["Soft/Quiet", "Gentle", "Delicate"],
+    ]
+
+    /// Random tracks that fit, loosening `wanted` until some do. Moods are the
+    /// softest part of a request, so they go first, then years. For one artist
+    /// (`artist`, its key) the artist is the anchor, so genres may go too.
+    private static func filteredTracks(_ wanted: inout Wanted, artist: String? = nil, connection: CLIConnection,
+                                       section: String) async throws -> [PlexMetadata] {
+        let extra = artist.map { [URLQueryItem(name: "artist.id", value: $0)] } ?? []
         while true {
-            tracks = try await randomTracks(genres: wantedGenres, moods: wantedMoods, from: fromYear, to: toYear,
-                                            connection: connection, section: section)
-            if !tracks.isEmpty { break }
-            if !wantedMoods.isEmpty, !(wantedGenres.isEmpty && fromYear == nil && toYear == nil) {
-                wantedMoods = []
-            } else if fromYear != nil || toYear != nil, !wantedGenres.isEmpty {
-                fromYear = nil
-                toYear = nil
+            let tracks = try await randomTracks(genres: wanted.genres, moods: wanted.moods, from: wanted.from,
+                                                to: wanted.to, extra: extra, connection: connection, section: section)
+            if !tracks.isEmpty { return tracks }
+            let hasYears = wanted.from != nil || wanted.to != nil
+            if !wanted.moods.isEmpty, artist != nil || !wanted.genres.isEmpty || hasYears {
+                wanted.moods = []
+                wanted.groups = []
+            } else if hasYears, artist != nil || !wanted.genres.isEmpty {
+                wanted.from = nil
+                wanted.to = nil
+            } else if !wanted.genres.isEmpty, artist != nil {
+                wanted.genres = []
             } else {
-                break
+                return []
             }
         }
+    }
 
-        var parts = wantedGenres.map(\.title) + wantedMoods.map(\.title)
-        switch (fromYear, toYear) {
-        case let (from?, to?): parts.append(from == to ? "\(from)" : "\(from)–\(to)")
-        case let (from?, nil): parts.append("From \(from)")
-        case let (nil, to?): parts.append("Up to \(to)")
-        case (nil, nil): break
-        }
+    private static func byDescription(_ request: PlayRequest, text: String, connection: CLIConnection,
+                                      section: String) async throws -> AskResult? {
+        var wanted = await wanted(request, text: text, connection: connection, section: section)
+        guard !wanted.isEmpty else { return nil }
+        let asked = wanted.parts
+        let tracks = try await filteredTracks(&wanted, connection: connection, section: section)
         // Random tracks are already a shuffle; radio and play read the same here.
         let action: AskAction = request.action == .queue ? .queue : .play
         let verb = request.action == .queue ? "Queue" : "Shuffle"
-        let label = "\(verb) · " + parts.joined(separator: " · ")
-        return AskResult(label: tracks.isEmpty ? label + ": nothing matches" : label, action: action, tracks: tracks)
+        guard !tracks.isEmpty else {
+            return AskResult(label: "", action: action,
+                             note: "Nothing matches \(asked.joined(separator: " · ")).")
+        }
+        var label = "\(verb) · " + wanted.parts.joined(separator: " · ")
+        let dropped = asked.filter { !wanted.parts.contains($0) }
+        if !dropped.isEmpty { label += " (none \(dropped.joined(separator: ", ")))" }
+        return AskResult(label: label, action: action, tracks: tracks)
     }
 
     private static func randomTracks(genres: [PlexGenre], moods: [PlexGenre], from: Int?, to: Int?,
@@ -353,6 +502,15 @@ enum CLIAsk {
         if let to { filters.append(URLQueryItem(name: "album.year<<", value: "\(to + 1)")) }
         return try await network.getRandomTracks(serverURL: connection.serverURL, authToken: connection.token,
                                                  sectionId: section, filters: filters, count: 100)
+    }
+
+    /// The words say something about when: a number, a decade or an era word.
+    static func mentionsTime(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains(/\d\d/) || decade(in: text) != nil { return true }
+        let words: Set<String> = ["recent", "new", "newer", "newest", "latest", "old", "older", "oldest", "oldies",
+                                  "classic", "classics", "decade", "century", "year", "years", "era"]
+        return lower.split(whereSeparator: { !$0.isLetter }).contains { words.contains(String($0)) }
     }
 
     /// "90s", "1990s", "the eighties" → 1990 / 1980. Two-digit decades read as 1900s
@@ -404,6 +562,59 @@ enum CLIAsk {
         else { return [:] }
         return Dictionary((container.MediaContainer.Directory ?? []).map { ($0.title.lowercased(), $0) },
                           uniquingKeysWith: { first, _ in first })
+    }
+
+    // MARK: - What is playing
+
+    /// A request about the playing track: "more like this" (radio from it),
+    /// "this album", "more by this artist".
+    enum PlayingReference {
+        case track, album(AskAction), artist(AskAction)
+
+        init?(_ text: String) {
+            let t = CLIAsk.normalized(text)
+            let words = Set(t.split(separator: " ").map(String.init))
+            let action: AskAction = words.contains("shuffle") ? .shuffle : words.contains("radio") ? .radio
+                : words.contains("queue") || words.contains("add") ? .queue : .play
+            if t.contains(/\b(this|current|playing) (album|record)\b/) {
+                self = .album(action)
+            } else if t.contains(/\b(this|current|playing) (artist|band|singer)\b/) {
+                self = .artist(action)
+            } else if t.contains(/\b(like|similar to|more of) this( (one|song|track))?$/)
+                        || t.contains(/^(radio|more) (from|of) (this|current|playing)( (one|song|track))?$/)
+                        || t.contains(/\b(this|current|playing) (song|track)\b/) && words.contains("radio") {
+                self = .track
+            } else {
+                return nil
+            }
+        }
+    }
+
+    private static func aboutPlaying(_ reference: PlayingReference, playing: PlexMetadata?,
+                                     connection: CLIConnection, section: String) async throws -> AskResult {
+        guard let playing else {
+            return AskResult(label: "", action: .play, note: "Nothing is playing to go on.")
+        }
+        switch reference {
+        case .track:
+            let result = AskResult(label: label(for: playing), action: .radio, tracks: [playing])
+            return try await finish(result, connection: connection)
+        case .album(let action):
+            guard let key = playing.parentRatingKey else { break }
+            var result = AskResult(label: "Album · \(playing.parentTitle ?? "Untitled")"
+                                   + (playing.grandparentTitle.map { " — \($0)" } ?? ""), action: action)
+            result.tracks = try await network.getChildren(serverURL: connection.serverURL,
+                                                          authToken: connection.token, ratingKey: key)
+            return try await finish(result, connection: connection)
+        case .artist(let action):
+            guard let key = playing.grandparentRatingKey else { break }
+            let artist = try await network.getMetadata(serverURL: connection.serverURL,
+                                                       authToken: connection.token, ratingKey: key)
+            var result = AskResult(label: label(for: artist), action: action)
+            result.tracks = try await tracks(of: artist, action: action, connection: connection, section: section)
+            return try await finish(result, connection: connection)
+        }
+        return AskResult(label: "", action: .play, note: "Plex doesn't say where this song is from.")
     }
 
     // MARK: - Keyword search
@@ -550,5 +761,34 @@ private extension Optional where Wrapped == String {
     var nonBlank: String? {
         guard let s = self?.trimmingCharacters(in: .whitespaces), !s.isEmpty else { return nil }
         return s
+    }
+}
+
+// MARK: - History
+
+/// The last few requests, oldest first, for up and down in the prompt; kept
+/// between runs in `reprise-cli/asks.json` (0600).
+enum AskHistory {
+    private static let limit = 20
+    private static var file: URL {
+        URL.applicationSupportDirectory.appending(path: "reprise-cli/asks.json")
+    }
+
+    static func load() -> [String] {
+        guard let data = try? Data(contentsOf: file),
+              let list = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return list
+    }
+
+    /// Adds a request (moving it to the end if it was asked before) and saves.
+    static func add(_ text: String, to list: inout [String]) {
+        list.removeAll { $0 == text }
+        list.append(text)
+        if list.count > limit { list.removeFirst(list.count - limit) }
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        FileManager.default.createFile(atPath: file.path, contents: data, attributes: [.posixPermissions: 0o600])
     }
 }
