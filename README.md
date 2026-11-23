@@ -36,6 +36,16 @@ reprise
 
 Or build it yourself with `swift build -c release` and run `.build/release/reprise`.
 
+Or download `reprise-<version>-macos-arm64.tar.gz` from the
+[latest release](https://github.com/andrew-snape/Reprise-Terminal/releases/latest), unpack
+it, and put `reprise` somewhere on your PATH.
+
+## Updating
+
+`reprise update` replaces a downloaded copy with the latest release. Reprise also checks
+once a day and mentions a new version at the bottom of the screen. A copy built from source
+updates with `git pull && scripts/install.sh`.
+
 ## First run
 
 Reprise shows a four-letter code. Go to **plex.tv/link**, enter it, and Reprise signs in.
@@ -46,6 +56,8 @@ reprise              browse and play
 reprise <request>    start playing what you ask for: reprise mellow radiohead
 reprise --server     choose a different server
 reprise --sign-out   forget this Mac's Plex sign-in
+reprise update       update to the latest release
+reprise --version    show the version
 ```
 
 ## Keys

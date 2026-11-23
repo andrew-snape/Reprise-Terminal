@@ -21,6 +21,17 @@ enum RepriseCLI {
     private static var app: CLIApp?
 
     static func main() {
+        // First, before anything slow (the Mac's name is a lookup): the updater runs `--version`.
+        let args = Array(CommandLine.arguments.dropFirst())
+        if args == ["--version"] || args == ["-v"] {
+            print("reprise \(CLIUpdate.version)")
+            return
+        }
+        if args == ["update"] {
+            Task { exit(await CLIUpdate.run()) }
+            dispatchMain()
+        }
+
         PlexAPI.platform = "macOS"
         PlexAPI.deviceName = (Host.current().localizedName ?? "Mac") + " (Terminal)"
 
@@ -37,6 +48,8 @@ enum RepriseCLI {
               reprise              browse and play
               reprise <request>    play what you ask for, e.g. reprise mellow radiohead
               reprise --server     choose a different server
+              reprise update       update to the latest release
+              reprise --version    show the version
               reprise --sign-out   forget this Mac's Plex sign-in
             """)
             return

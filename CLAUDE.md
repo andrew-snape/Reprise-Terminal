@@ -25,6 +25,7 @@ foreground, stopping when the window closes.
 Sources/reprise/
 ├── RepriseCLI.swift    # @main: flags, PlexAPI identity, keeps CLIApp alive, dispatchMain()
 ├── CLISignIn.swift     # CLIConfig (token file), PIN sign-in, server choice, connection ranking
+├── CLIUpdate.swift     # `reprise update` from GitHub releases, daily new-version notice
 ├── CLIApp.swift        # pages (libraries → artists → albums → tracks, playlists, queue,
 │                       #   ask results), Now Playing screen, keys, drawing, reconnects
 ├── CLIAsk.swift        # "ask": Foundation Models reads a request, Plex finds the music
@@ -201,6 +202,19 @@ Sources/reprise/
   looked poor.) Stacked and centred, or beside the words when the window is wide and
   short. Covers come from `/photo/:/transcode` at 600 px, one fetch per album, and also
   go to Control Centre.
+- **Updates** (`CLIUpdate`): `reprise update` reads GitHub's latest release, downloads the
+  `*-macos-arm64.tar.gz` asset into a `.reprise-update-*` folder beside the binary, runs the
+  new binary's `--version` (it must print exactly `reprise <tag>`), then `rename(2)`s it over
+  the old one: never copy onto it, since writing into a signed Mach-O's file gets the next
+  launch killed. A binary under `.build/` is a source build: it is told to
+  `git pull && scripts/install.sh`. On launch GitHub is asked at most once a day
+  (`updateCheckedAt`, `latestVersion` in UserDefaults) and a newer version is flashed.
+  `--version` and `update` are handled first in `main()`, before the slow Mac-name lookup.
+  **`CLIUpdate.version` must equal the release tag** (without "v"), or the release fails
+  its own check and the notice nags. `scripts/release.sh [version] [notes.md]` does it all
+  from a clean main: bumps the constant (next patch by default), builds, checks
+  `--version`, tags, pushes, and creates the GitHub release with the tarball. Releases are
+  public: run it only when asked to release.
 - **Never print or log URLs.** File and transcode URLs carry the token. Error text goes
   through `SensitiveDataRedactor.redact`.
 
