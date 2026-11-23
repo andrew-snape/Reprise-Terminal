@@ -88,6 +88,9 @@ reprise --sign-out   forget this Mac's Plex sign-in
 - The queue is saved when you quit and comes back, paused, next time.
 - The playing track shows in Control Centre, and the keyboard's media keys work.
 - Plex hears what you play, so play counts and history work the same as in other Plex apps.
+- The next two tracks are downloaded as you play, so skips start at once and replays
+  need no network. Up to 4 GB is kept in `~/Library/Caches/reprise-cli/audio`, the
+  least recently played going first; delete the folder to clear it.
 
 ## Privacy and your sign-in
 

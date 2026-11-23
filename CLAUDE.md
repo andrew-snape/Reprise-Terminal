@@ -172,9 +172,10 @@ Sources/reprise/
   `<server>-<part id>-<part size>.<container>`, so a replaced file is a new name. Written
   as `.part`, size checked against Plex's, then renamed; `.part` leftovers go on launch.
   `source(for:)` plays a cached file first, even on relay. `readAhead` (every tick)
-  downloads the next two tracks, one at a time, under their own
-  `X-Plex-Session-Identifier` (a read open on the playing session makes Plex refuse
-  AVPlayer's request for that file); never on relay or a metered/constrained path. If the
+  downloads the next two tracks, one at a time, on the run's one session id (a second
+  id risks Plex ending AVPlayer's read); never on relay or a metered/constrained path.
+  Untested: if AVPlayer asks for a track whose download is still open, Plex may refuse
+  it (-1008); the quiet retry covers that. If the
   queued follow-on's file lands with over 10 s of the current track left, it is swapped
   for the file. A cached file that fails is deleted. The first track of a queue is only
   cached by slow start.

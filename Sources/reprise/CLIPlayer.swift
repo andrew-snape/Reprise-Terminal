@@ -25,9 +25,6 @@ final class CLIPlayer {
     private let network = PlexNetworkManager.shared
     private let player = AVQueuePlayer()
     private let sessionID = UUID().uuidString
-    /// Cache downloads read under their own session id: a read still open on
-    /// `sessionID` makes Plex refuse AVPlayer's request for the same file.
-    private let downloadSessionID = UUID().uuidString
     private let cache = CLICache()
     /// On a metered or constrained network nothing is read ahead.
     var metered = false
@@ -440,7 +437,8 @@ final class CLIPlayer {
     }
 
     /// Keeps the next two direct-play tracks downloading into the cache, one
-    /// read at a time beside AVPlayer's. When the queued follow-on lands before
+    /// read at a time beside AVPlayer's, on the same Plex session (a second
+    /// session id could make Plex end the one AVPlayer is reading). When the queued follow-on lands before
     /// it starts, it is swapped for the file. Never on relay or a metered network.
     private func readAhead() {
         guard restoredAt == nil, let index else {
@@ -453,7 +451,7 @@ final class CLIPlayer {
             guard let name = cacheName(tracks[i]) else { continue }
             keep.insert(name)
             guard i > index, !connection.isRelay, !metered, !cache.contains(name),
-                  let url = directURL(for: tracks[i], session: downloadSessionID) else { continue }
+                  let url = directURL(for: tracks[i], session: sessionID) else { continue }
             wanted.insert(name)
             // One download at a time: the nearer track first.
             if wanted.count == 1 { _ = cache.fetch(name, from: url, size: tracks[i].Media?.first?.Part?.first?.size) }
@@ -488,7 +486,7 @@ final class CLIPlayer {
         let track = tracks[entry.index]
         guard Date().timeIntervalSince(since) > 1.5, download?.index != entry.index,
               let name = cacheName(track),
-              let url = directURL(for: track, session: downloadSessionID) else { return }
+              let url = directURL(for: track, session: sessionID) else { return }
         download?.task.cancel()
         let index = entry.index
         let fetch = cache.fetch(name, from: url, size: track.Media?.first?.Part?.first?.size)

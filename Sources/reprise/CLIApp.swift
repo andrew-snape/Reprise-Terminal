@@ -100,6 +100,8 @@ final class CLIApp {
     // MARK: - Run
 
     func run() async {
+        // Older builds kept slow-start copies here.
+        try? FileManager.default.removeItem(at: FileManager.default.temporaryDirectory.appending(path: "reprise-cli"))
         artwork.onChange = { [weak self] in
             self?.nowPlaying?.update()
             self?.draw()
