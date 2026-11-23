@@ -172,6 +172,7 @@ final class CLIApp {
         monitor.start(queue: .main)
         pathMonitor = monitor
 
+        Task { await showUpdateNotice() }
         await loadLibraries()
     }
 
@@ -738,6 +739,14 @@ final class CLIApp {
         var page = Page(kind: .queue, title: "Queue", rows: trackRows(player.tracks, numbered: false))
         page.selected = player.index ?? 0
         push(page)
+    }
+
+    /// A newer release, mentioned once the launch messages have had their turn.
+    private func showUpdateNotice() async {
+        guard let notice = await CLIUpdate.notice() else { return }
+        try? await Task.sleep(for: .seconds(3))
+        while Date() < statusUntil || loading { try? await Task.sleep(for: .seconds(1)) }
+        flash(notice)
     }
 
     private func flash(_ message: String) {
