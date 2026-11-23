@@ -17,6 +17,10 @@ foreground, stopping when the window closes.
   `RivuletCore`, because RivuletCore's types are internal.
 - **No dependencies.** AVFoundation plays; Foundation Models (ask), MediaPlayer (Now Playing)
   and Network (path changes) are system frameworks.
+- **Release**: `scripts/release.sh [version] [notes.md]` (next patch by default) bumps
+  `CLIUpdate.version`, builds, tags, pushes and publishes the GitHub release with
+  `reprise-<version>-macos-arm64.tar.gz`. Only when asked; releases are public. Notes are
+  short user-facing bullets, as in earlier releases.
 - **Repo is public** (since Nov 2026). Keep commit messages short and plain, and never commit tokens, server addresses or account details.
 
 ## Layout
@@ -159,7 +163,8 @@ Sources/reprise/
 - **Saved queue**: `reprise-cli/queue.json` (rating keys, index, time, server id), written
   on track change, pause, queue edits and quit, deleted when the queue plays out; on launch
   it comes back paused (batched `/library/metadata/k1,k2,…`) but **nothing is loaded into
-  AVPlayer until play is pressed** (`restoredAt`). AVPlayer reads ahead even while paused,
+  AVPlayer until play is pressed** (`restoredAt`); the track itself downloads into the
+  cache meanwhile (`prefetchRestored`, see Cache). AVPlayer reads ahead even while paused,
   and while that read is open Plex refuses a new request for the same file on this session
   (-1008, CoreMedia -16849); AVQueuePlayer then skips the item by itself, which looked like
   "starts at a different song each time".
@@ -244,7 +249,12 @@ and a Plex sign-in. From a non-interactive shell:
 - `reprise --ask "<request>"` signs in from the saved config and prints how the request was
   read and what it found (titles only).
 - A Python `pty.fork()` driver can start the app, send keys and read the frames (each draw
-  starts with `ESC [?25l`); avoid keys that start playback unless sound is wanted.
+  starts with `ESC [?25l`); avoid keys that start playback unless sound is wanted. Check
+  `pgrep -x reprise` first: a running copy shares the saved queue, cache and Plex client id,
+  so tests beside it prove nothing (and moving its cache files disturbs its playback).
+- The updater: copy the binary out of `.build` (there it is a source build), build with
+  `CLIUpdate.version` set below the latest release, run `<copy> update`, and put the
+  constant back.
 
 `TTY.swift` imports only Foundation, so the key decoder and column widths can be checked
 alone: `swiftc -swift-version 5 Sources/reprise/TTY.swift main.swift`, with a `main.swift`

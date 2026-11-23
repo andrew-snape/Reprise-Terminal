@@ -22,10 +22,24 @@ It reads the terminal's background and adjusts for light themes such as Terminal
 ## Requirements
 
 - An Apple silicon Mac running macOS 27 or later
-- Swift 6.2 or later (comes with Xcode)
 - A Plex Media Server with a music library
+- To build from source: Swift 6.2 or later (comes with Xcode)
 
 ## Install
+
+Download `reprise-<version>-macos-arm64.tar.gz` from the
+[latest release](https://github.com/andrew-snape/Reprise-Terminal/releases/latest), then:
+
+```sh
+tar -xzf reprise-*-macos-arm64.tar.gz
+xattr -d com.apple.quarantine reprise     # the binary is unsigned
+mkdir -p ~/.local/bin && mv reprise ~/.local/bin/
+reprise
+```
+
+`~/.local/bin` needs to be on your PATH; any folder on it will do.
+
+Or build from source:
 
 ```sh
 git clone https://github.com/andrew-snape/Reprise-Terminal.git
@@ -34,17 +48,12 @@ scripts/install.sh        # builds a release build and links ~/.local/bin/repris
 reprise
 ```
 
-Or build it yourself with `swift build -c release` and run `.build/release/reprise`.
-
-Or download `reprise-<version>-macos-arm64.tar.gz` from the
-[latest release](https://github.com/andrew-snape/Reprise-Terminal/releases/latest), unpack
-it, and put `reprise` somewhere on your PATH.
-
 ## Updating
 
-`reprise update` replaces a downloaded copy with the latest release. Reprise also checks
-once a day and mentions a new version at the bottom of the screen. A copy built from source
-updates with `git pull && scripts/install.sh`.
+`reprise update` replaces a downloaded copy with the latest release, after checking the
+new binary runs. Reprise also checks once a day and mentions a new version at the bottom of
+the screen. A copy built from source updates with `git pull && scripts/install.sh`.
+Copies older than 0.1.5 don't have `reprise update`: download 0.1.5 or later once by hand.
 
 ## First run
 
@@ -97,7 +106,8 @@ reprise --version    show the version
   `~/Library/Application Support/reprise-cli/asks.json`, readable only by you.
 - Loudness levelling uses Plex's own loudness analysis, so quiet and loud albums sit
   together. It only ever turns music down.
-- The queue is saved when you quit and comes back, paused, next time.
+- The queue is saved when you quit and comes back, paused, next time. Its track downloads
+  while paused, so space starts it at once.
 - The playing track shows in Control Centre, and the keyboard's media keys work.
 - Plex hears what you play, so play counts and history work the same as in other Plex apps.
 - The next two tracks are downloaded as you play, so skips start at once and replays
@@ -110,7 +120,8 @@ reprise --version    show the version
   readable only by you. `reprise --sign-out` deletes it.
 - Reprise Terminal never reads or writes the Keychain. If macOS ever asks whether
   "reprise" may use the `com.rivulet.plex` keychain item (Reprise for Mac's), click **Deny**.
-- Nothing is sent anywhere except your Plex server and plex.tv.
+- Nothing is sent anywhere except your Plex server and plex.tv, plus a once-a-day check of
+  GitHub for a new release (an anonymous request for the latest version number).
 
 ## If it ever gets stuck
 
