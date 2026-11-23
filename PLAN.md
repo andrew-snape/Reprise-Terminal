@@ -19,12 +19,17 @@ In order. Each step ships on its own.
   "this album", "this artist" from the playing track; request history (↑ ↓, kept between
   runs); `reprise <request>` starts the app playing it; everyday mood words ("chill",
   "upbeat"). Radio or an album from the playing track keeps it playing (tested Nov 2026).
+- **Next album** (`A`): when a whole album reaches its last track, the artist's next album
+  by release date is queued.
+- **Cache**: 4 GB of whole files, the next two tracks read ahead; a restored queue's track
+  downloads while paused (heard: space starts at once, 24 Nov 2026).
+- **Updates**: `reprise update` and a daily notice from GitHub releases;
+  `scripts/release.sh` bumps, tags and publishes. 0.1.4 → 0.1.5 updated itself (24 Nov 2026).
 
 ## Next
 
-- **Cache** (built Nov 2026, not yet heard): 4 GB, read ahead two tracks. Check in a real
-  queue that downloads beside AVPlayer cause no refusals or stalls, the follow-on swap is gapless, and
-  relay plays cached originals.
+- **Cache**: check in a real queue that downloads beside AVPlayer cause no refusals or
+  stalls, the follow-on swap is gapless, and relay plays cached originals.
 
 - Verify in a real terminal: Now Playing from a bare CLI, the slow-start swap, levelling.
 - Ask: "recent" and "classic" don't become years yet; artists split across names
