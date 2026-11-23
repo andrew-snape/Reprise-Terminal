@@ -68,6 +68,7 @@ reprise --sign-out   forget this Mac's Plex sign-in
 | tab | Show the queue |
 | P | Playlists |
 | L | Loudness levelling on or off |
+| A | Next album after an album on or off |
 | PgUp PgDn, g G | Page, jump to top or bottom |
 | q | Quit (music stops) |
 
@@ -76,7 +77,8 @@ reprise --sign-out   forget this Mac's Plex sign-in
 - Files AVFoundation can open (MP3, AAC, ALAC, FLAC, WAV, AIFF) play as the original file.
   Anything else (Opus, Vorbis, WMA, DSD), and every track over a Plex relay connection,
   plays as a 320 kbps AAC transcode. The bottom bar shows which.
-- An album plays gaplessly.
+- An album plays gaplessly. When a whole album reaches its last track, the artist's next
+  album by release date is added to the queue and follows on (`A` turns this off).
 - Ask uses Apple Intelligence on the Mac to understand the request, and Plex to find the
   music; without Apple Intelligence it is a keyword search. Nothing leaves the Mac but the
   search itself, sent to your Plex server. The last 20 requests are kept in

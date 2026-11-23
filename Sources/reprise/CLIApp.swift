@@ -84,6 +84,10 @@ final class CLIApp {
     /// The Matrix rain's step, advanced while the Now Playing screen shows music playing.
     private var rainFrame = 1
     private var rainTimer: DispatchSourceTimer?
+    /// When a whole album has played to its last track, the artist's next album follows (`A` toggles).
+    private var nextAlbum = true
+    /// The track the next-album check last ran for: it runs once per track.
+    private var nextAlbumChecked: String?
 
     /// The player owns the connection, so a reconnect changes it in one place.
     private var connection: CLIConnection { player.connection }
@@ -133,6 +137,7 @@ final class CLIApp {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if let message = self.player.tick() { self.flash(message) }
+                self.queueNextAlbum()
                 if self.player.needsReconnect, Date().timeIntervalSince(self.lastReconnect) > 10 { self.reconnect() }
                 self.artwork.want(self.player.current, connection: self.connection)
                 self.nowPlaying?.update()
@@ -380,6 +385,10 @@ final class CLIApp {
         case .char("L"):
             player.levelling.toggle()
             flash(player.levelling ? "Loudness levelling on." : "Loudness levelling off.")
+        case .char("A"):
+            nextAlbum.toggle()
+            nextAlbumChecked = nil
+            flash(nextAlbum ? "Next album after an album: on." : "Next album after an album: off.")
         case .tab: toggleQueue()
         case .char("v"):
             guard player.current != nil else { flash("Nothing playing yet."); return }
@@ -527,6 +536,53 @@ final class CLIApp {
         player.remove(at: index)
         refreshQueuePage()
         if player.tracks.isEmpty { stack.removeLast() }
+    }
+
+    // MARK: - Next album
+
+    /// On the last track of the queue, when the queue holds the whole of that
+    /// track's album, the same artist's next album by release date goes on the
+    /// end, so it follows gaplessly. Checked once per track.
+    private func queueNextAlbum() {
+        guard nextAlbum, let track = player.current, let key = track.ratingKey, nextAlbumChecked != key,
+              player.index == player.tracks.count - 1,
+              let albumKey = track.parentRatingKey, let artistKey = track.grandparentRatingKey else { return }
+        nextAlbumChecked = key
+        let queued = Set(player.tracks.compactMap(\.ratingKey))
+        let server = connection
+        Task {
+            func children(_ key: String) async -> [PlexMetadata] {
+                (try? await network.getChildren(serverURL: server.serverURL, authToken: server.token, ratingKey: key)) ?? []
+            }
+            let albumTracks = await children(albumKey)
+            guard !albumTracks.isEmpty, albumTracks.allSatisfy({ $0.ratingKey.map(queued.contains) ?? false }) else { return }
+            let albums = Self.chronological(await children(artistKey).filter { $0.type == "album" })
+            guard let at = albums.firstIndex(where: { $0.ratingKey == albumKey }), at + 1 < albums.count,
+                  let nextKey = albums[at + 1].ratingKey else { return }
+            let tracks = await children(nextKey)
+            // Still on that last track, with nothing added meanwhile.
+            guard nextAlbum, !tracks.isEmpty, player.current?.ratingKey == key,
+                  player.index == player.tracks.count - 1 else { return }
+            player.enqueue(tracks, next: false)
+            refreshQueuePage()
+            let album = albums[at + 1]
+            flash("Up next: \(album.title ?? "the next album")" + (album.year.map { " (\($0))" } ?? "") + ".")
+        }
+    }
+
+    /// Albums by release date (or year); undated ones last, ties in Plex's order.
+    private static func chronological(_ albums: [PlexMetadata]) -> [PlexMetadata] {
+        func date(_ album: PlexMetadata) -> String? {
+            album.originallyAvailableAt ?? album.year.map { String(format: "%04d", $0) }
+        }
+        return albums.enumerated().sorted { l, r in
+            switch (date(l.element), date(r.element)) {
+            case let (a?, b?) where a != b: return a < b
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return l.offset < r.offset
+            }
+        }.map(\.element)
     }
 
     private func refreshQueuePage() {
@@ -841,11 +897,11 @@ final class CLIApp {
         } else if loading {
             out += " \(TTY.accent)\(["◐", "◓", "◑", "◒"][spinner % 4])\(TTY.reset) \(TTY.dim)\(loadingText.fitted(width - 4))\(TTY.reset)"
         } else if showingNow {
-            let help = ["space pause", "n/p next/prev", ",/. seek", "← back", ": ask", "r radio", "tab queue", "L levelling"]
+            let help = ["space pause", "n/p next/prev", ",/. seek", "← back", ": ask", "r radio", "tab queue", "L levelling", "A next album"]
             out += " " + TTY.dim + Self.hints(help, width: width - 2) + TTY.reset
         } else {
             var help = ["⏎ open", "← back", "space pause", ": ask", "/ filter", "n/p next/prev", "a play", "s shuffle",
-                        "v now playing", "tab queue", "r radio", "+/= queue", ",/. seek", "P playlists", "L levelling"]
+                        "v now playing", "tab queue", "r radio", "+/= queue", ",/. seek", "P playlists", "L levelling", "A next album"]
             if stack.last?.kind == .queue { help.insert("x remove", at: 3) }
             out += " " + TTY.dim + Self.hints(help, width: width - 2) + TTY.reset
         }
