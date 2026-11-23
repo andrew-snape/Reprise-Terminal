@@ -172,6 +172,11 @@ Sources/reprise/
 - **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
   metadata (album gain when one album plays in order), set on the player when a track starts
   (the next item's on `didPlayToEndTime`, so no loud first moment).
+- **Next album** (`A` toggles, on by default, `CLIApp.queueNextAlbum`): once per track, when
+  the last track of the queue starts and the queue holds every track of its album, the
+  artist's albums (`grandparentRatingKey` children) are sorted by `originallyAvailableAt`,
+  then year (undated last), and the one after it is enqueued at the end, so it is gapless.
+  Dropped if the track or the queue changed while fetching.
 - **Now Playing screen** (`v`, and opened whenever music is started: a track, `a`, `s`,
   `r` or ask; not queueing, pause or skips): the cover as Matrix-style text, one cell a pixel (a square
   cover is `2 × rows` cells across): half-width katakana (one column each) and digits in
