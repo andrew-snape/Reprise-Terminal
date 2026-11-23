@@ -178,7 +178,9 @@ Sources/reprise/
   it (-1008); the quiet retry covers that. If the
   queued follow-on's file lands with over 10 s of the current track left, it is swapped
   for the file. A cached file that fails is deleted. The first track of a queue is only
-  cached by slow start.
+  cached by slow start, except a restored queue's: `prefetchRestored` downloads it while
+  paused under a second session id (AVPlayer holds nothing yet, so there is no read for
+  Plex to end), and Space plays the file if it landed, else stops the download and streams.
 - **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into the
   cache and swapped in at the same position if still waiting; if it started meanwhile,
   the file stays cached. Never on relay or for a transcode.

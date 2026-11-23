@@ -25,6 +25,8 @@ final class CLIPlayer {
     private let network = PlexNetworkManager.shared
     private let player = AVQueuePlayer()
     private let sessionID = UUID().uuidString
+    /// The session a restored queue's track downloads under while paused (see `prefetchRestored`).
+    private let prefetchSessionID = UUID().uuidString
     private let cache = CLICache()
     /// On a metered or constrained network nothing is read ahead.
     var metered = false
@@ -125,7 +127,9 @@ final class CLIPlayer {
 
     func togglePause() {
         if let at = restoredAt, let index {
-            // The restored queue is loaded now, at its place.
+            // The restored queue is loaded now, at its place: from the file if it
+            // landed, else streamed, with its download stopped.
+            cache.cancel(except: [])
             load(from: index)
             if at > 1 {
                 pendingSeek = at
@@ -442,7 +446,7 @@ final class CLIPlayer {
     /// it starts, it is swapped for the file. Never on relay or a metered network.
     private func readAhead() {
         guard restoredAt == nil, let index else {
-            cache.cancel(except: [])
+            prefetchRestored()
             return
         }
         var keep: Set<String> = []
@@ -468,6 +472,23 @@ final class CLIPlayer {
             dropQueued()
             topUp()
         }
+    }
+
+    /// A restored queue's track, downloaded while paused so Space starts at once.
+    /// Under its own session id: AVPlayer holds nothing yet, and a read open on the
+    /// playing session makes Plex refuse AVPlayer's request for that file (-1008).
+    /// Never on relay or a metered network.
+    private func prefetchRestored() {
+        guard restoredAt != nil, let index, !connection.isRelay, !metered,
+              let name = cacheName(tracks[index]) else {
+            cache.cancel(except: [])
+            return
+        }
+        cache.protected = [name]
+        if !cache.contains(name), let url = directURL(for: tracks[index], session: prefetchSessionID) {
+            _ = cache.fetch(name, from: url, size: tracks[index].Media?.first?.Part?.first?.size)
+        }
+        cache.cancel(except: [name])
     }
 
     /// AVPlayer's own progressive read of a big lossless file can sit waiting for
