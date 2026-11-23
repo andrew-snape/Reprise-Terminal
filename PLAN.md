@@ -22,6 +22,10 @@ In order. Each step ships on its own.
 
 ## Next
 
+- **Cache** (built Nov 2026, not yet heard): 4 GB, read ahead two tracks. Check in a real
+  queue that the download session id avoids refusals, the follow-on swap is gapless, and
+  relay plays cached originals.
+
 - Verify in a real terminal: Now Playing from a bare CLI, the slow-start swap, levelling.
 - Ask: "recent" and "classic" don't become years yet; artists split across names
   ("Nick Cave" and "Nick Cave & the Bad Seeds") are searched as one only by luck.

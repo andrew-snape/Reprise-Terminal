@@ -11,8 +11,9 @@
 //  is left, as the Mac app's `finishMusic` does.
 //
 //  Also here: queue editing, loudness levelling from Plex's gain analysis, the
-//  whole-file download that rescues a big lossless track stuck starting, and
-//  the saved queue that comes back on the next launch.
+//  read-ahead into the disk cache (`CLICache`), the whole-file download that
+//  rescues a big lossless track stuck starting, and the saved queue that comes
+//  back on the next launch.
 //
 
 import AVFoundation
@@ -24,6 +25,12 @@ final class CLIPlayer {
     private let network = PlexNetworkManager.shared
     private let player = AVQueuePlayer()
     private let sessionID = UUID().uuidString
+    /// Cache downloads read under their own session id: a read still open on
+    /// `sessionID` makes Plex refuse AVPlayer's request for the same file.
+    private let downloadSessionID = UUID().uuidString
+    private let cache = CLICache()
+    /// On a metered or constrained network nothing is read ahead.
+    var metered = false
 
     /// An item in the queue, held until it is left so its identity is never reused.
     private struct Entry {
@@ -32,7 +39,7 @@ final class CLIPlayer {
         var index: Int
         /// The transcoder's session, when the item is a transcode.
         let transcode: String?
-        /// The downloaded copy it plays from, deleted when the item is left.
+        /// The cached file it plays from.
         var file: URL?
         var isLocal: Bool { file != nil }
     }
@@ -209,6 +216,7 @@ final class CLIPlayer {
         tracks = []
         index = nil
         download?.task.cancel()
+        cache.cancel(except: [])
         await withTaskGroup(of: Void.self) { group in
             if let track {
                 group.addTask { await self.report(track, time: time, state: "stopped") }
@@ -292,7 +300,6 @@ final class CLIPlayer {
             } else {
                 let left = entries
                 player.removeAllItems()
-                for file in left.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
                 entries = []
                 followed = nil
                 index = nil
@@ -342,6 +349,8 @@ final class CLIPlayer {
             }
             player.advanceToNextItem()
             if let entry {
+                // A cached file that won't play is fetched afresh next time.
+                if entry.isLocal, let name = cacheName(tracks[entry.index]) { cache.remove(name) }
                 forget(entry)
                 if player.currentItem == nil {
                     // It was the last track: the queue is done.
@@ -372,6 +381,7 @@ final class CLIPlayer {
                     holdAndRetry(old.index, at: 0)
                     return message
                 }
+                if old.isLocal, let name = cacheName(tracks[old.index]) { cache.remove(name) }
                 forget(old)
                 refusedRetry = nil
                 message = "\(tracks[old.index].title ?? "A track") wouldn't play, skipped."
@@ -412,17 +422,61 @@ final class CLIPlayer {
             if index + 1 < tracks.count { fetchDetails(tracks[index + 1]) }
         }
         rescueSlowStart()
+        readAhead()
         report(force: player.currentItem != nil && player.currentItem !== reportedItem)
         return message
     }
 
-    // MARK: - Slow start on big files
+    // MARK: - Cache: read-ahead and slow start
+
+    /// The cache name of a track's file, when it can be played as a file at all.
+    private func cacheName(_ track: PlexMetadata) -> String? {
+        guard Self.avFoundationPlays(track.Media?.first) else { return nil }
+        return CLICache.name(for: track, serverID: connection.serverID)
+    }
+
+    func isCached(_ track: PlexMetadata) -> Bool {
+        cacheName(track).map(cache.contains) ?? false
+    }
+
+    /// Keeps the next two direct-play tracks downloading into the cache, one
+    /// read at a time beside AVPlayer's. When the queued follow-on lands before
+    /// it starts, it is swapped for the file. Never on relay or a metered network.
+    private func readAhead() {
+        guard restoredAt == nil, let index else {
+            cache.cancel(except: [])
+            return
+        }
+        var keep: Set<String> = []
+        var wanted: Set<String> = []
+        for i in index..<min(index + 3, tracks.count) {
+            guard let name = cacheName(tracks[i]) else { continue }
+            keep.insert(name)
+            guard i > index, !connection.isRelay, !metered, !cache.contains(name),
+                  let url = directURL(for: tracks[i], session: downloadSessionID) else { continue }
+            wanted.insert(name)
+            // One download at a time: the nearer track first.
+            if wanted.count == 1 { _ = cache.fetch(name, from: url, size: tracks[i].Media?.first?.Part?.first?.size) }
+        }
+        if let d = download, let name = cacheName(tracks[d.index]) { wanted.insert(name) }
+        cache.protected = keep
+        cache.cancel(except: wanted)
+
+        // The follow-on is queued streaming; with its file here, play that instead.
+        if let playing = followed, playing.item === player.currentItem,
+           let queued = entries.first(where: { $0.index == index + 1 }), !queued.isLocal,
+           let name = cacheName(tracks[queued.index]), cache.contains(name),
+           duration - time > 10 {
+            dropQueued()
+            topUp()
+        }
+    }
 
     /// AVPlayer's own progressive read of a big lossless file can sit waiting for
     /// 20 to 30 s. While the current direct-play item has waited more than 1.5 s,
-    /// the whole file is downloaded; if the track is still waiting when it lands,
-    /// it carries on from the copy at the same place (as Reprise for Mac's
-    /// `playCurrentFromFile`). Never on relay, never for a transcode.
+    /// the whole file is downloaded into the cache; if the track is still waiting
+    /// when it lands, it carries on from the file at the same place (as Reprise for
+    /// Mac's `playCurrentFromFile`). Never on relay, never for a transcode.
     private func rescueSlowStart() {
         guard let entry = followed, entry.transcode == nil, !entry.isLocal, !connection.isRelay,
               player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
@@ -431,17 +485,15 @@ final class CLIPlayer {
         }
         let since = waitingSince ?? Date()
         waitingSince = since
+        let track = tracks[entry.index]
         guard Date().timeIntervalSince(since) > 1.5, download?.index != entry.index,
-              let (url, _) = source(for: tracks[entry.index]) else { return }
+              let name = cacheName(track),
+              let url = directURL(for: track, session: downloadSessionID) else { return }
         download?.task.cancel()
         let index = entry.index
-        let track = tracks[index]
+        let fetch = cache.fetch(name, from: url, size: track.Media?.first?.Part?.first?.size)
         let task = Task { [weak self] in
-            guard let file = await Self.downloadWhole(url, track: track) else { return }
-            guard let self, !Task.isCancelled else {
-                try? FileManager.default.removeItem(at: file)
-                return
-            }
+            guard let file = await fetch.value, let self, !Task.isCancelled else { return }
             self.swapToFile(file, index: index)
         }
         download = (index, task)
@@ -449,12 +501,9 @@ final class CLIPlayer {
 
     private func swapToFile(_ file: URL, index: Int) {
         download = nil
+        // It started (or moved on) without the file: it stays cached for next time.
         guard let old = followed, old.index == index,
-              player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
-            // It started (or moved on) without the copy: no use for it.
-            try? FileManager.default.removeItem(at: file)
-            return
-        }
+              player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
         let at = time
         let item = makeItem(file)
         let entry = Entry(item: item, index: index, transcode: nil, file: file)
@@ -469,29 +518,6 @@ final class CLIPlayer {
         reportedItem = item
     }
 
-    /// Downloads into the temp folder, named for its container so AVFoundation
-    /// knows the format. Nil on failure.
-    nonisolated private static func downloadWhole(_ url: URL, track: PlexMetadata) async -> URL? {
-        var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        guard let (temp, response) = try? await PlexCertificateDelegate.session.download(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        let ext = track.Media?.first?.container ?? "audio"
-        let destination = cacheFolder.appending(path: "\(track.ratingKey ?? UUID().uuidString)-\(UUID().uuidString.prefix(6)).\(ext)")
-        try? FileManager.default.createDirectory(at: cacheFolder, withIntermediateDirectories: true)
-        guard (try? FileManager.default.moveItem(at: temp, to: destination)) != nil else { return nil }
-        return destination
-    }
-
-    nonisolated static var cacheFolder: URL {
-        FileManager.default.temporaryDirectory.appending(path: "reprise-cli", directoryHint: .isDirectory)
-    }
-
-    /// Downloaded copies are only for this run: cleared on launch and on quit.
-    nonisolated static func clearCache() {
-        try? FileManager.default.removeItem(at: cacheFolder)
-    }
-
     // MARK: - Loading
 
     /// Plays from `start`: the track and the one after it go into AVPlayer, the
@@ -504,7 +530,6 @@ final class CLIPlayer {
         // The old queue is left. AVPlayer only reads the current item and the next,
         // so only those two can have a transcoder running.
         for entry in entries.prefix(2) { Task { await stopTranscode(entry) } }
-        for file in entries.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
         download?.task.cancel()
         download = nil
         waitingSince = nil
@@ -520,7 +545,7 @@ final class CLIPlayer {
         for i in start..<tracks.count {
             guard let (url, transcode) = source(for: tracks[i]) else { continue }
             let item = makeItem(url)
-            entries.append(Entry(item: item, index: i, transcode: transcode))
+            entries.append(Entry(item: item, index: i, transcode: transcode, file: url.isFileURL ? url : nil))
             player.insert(item, after: nil)
             break
         }
@@ -537,7 +562,7 @@ final class CLIPlayer {
         for i in (current.index + 1)..<max(current.index + 1, tracks.count) {
             guard let (url, transcode) = source(for: tracks[i]) else { continue }
             let item = makeItem(url)
-            entries.append(Entry(item: item, index: i, transcode: transcode))
+            entries.append(Entry(item: item, index: i, transcode: transcode, file: url.isFileURL ? url : nil))
             player.insert(item, after: current.item)
             return
         }
@@ -559,7 +584,6 @@ final class CLIPlayer {
         let left = entries
         player.removeAllItems()
         for entry in left.prefix(2) { Task { await stopTranscode(entry) } }
-        for file in left.compactMap(\.file) { try? FileManager.default.removeItem(at: file) }
         entries = []
         followed = nil
         index = wanted
@@ -595,7 +619,6 @@ final class CLIPlayer {
     /// An item that is done with: dropped, and its transcoder freed.
     private func forget(_ entry: Entry) {
         entries.removeAll { $0.item === entry.item }
-        if let file = entry.file { try? FileManager.default.removeItem(at: file) }
         Task { await stopTranscode(entry) }
     }
 
@@ -605,26 +628,33 @@ final class CLIPlayer {
                                            sessionId: session)
     }
 
-    /// The file itself when AVFoundation opens it, else a 320k AAC transcode
-    /// (with its transcoder session). Relay connections always transcode.
+    /// The cached file when there is one (even on relay), else the file itself
+    /// when AVFoundation opens it, else a 320k AAC transcode (with its
+    /// transcoder session). Relay connections otherwise always transcode.
     private func source(for track: PlexMetadata) -> (URL, String?)? {
-        let media = track.Media?.first
-        if !connection.isRelay, Self.avFoundationPlays(media), let partKey = media?.Part?.first?.key,
-           let base = URL(string: connection.serverURL),
-           var components = URLComponents(url: base.appending(path: partKey), resolvingAgainstBaseURL: false) {
-            components.queryItems = (components.queryItems ?? []) + [
-                URLQueryItem(name: "X-Plex-Token", value: connection.token),
-                URLQueryItem(name: "X-Plex-Client-Identifier", value: PlexAPI.clientIdentifier),
-                URLQueryItem(name: "X-Plex-Platform", value: PlexAPI.platform),
-                URLQueryItem(name: "X-Plex-Product", value: PlexAPI.productName),
-                URLQueryItem(name: "X-Plex-Session-Identifier", value: sessionID)
-            ]
-            return components.url.map { ($0, nil) }
-        }
+        if let name = cacheName(track), let file = cache.file(for: name) { return (file, nil) }
+        if !connection.isRelay, let url = directURL(for: track, session: sessionID) { return (url, nil) }
         guard let key = track.ratingKey else { return nil }
         let transcode = UUID().uuidString
         return network.buildMusicTranscodeURL(serverURL: connection.serverURL, authToken: connection.token,
                                               ratingKey: key, sessionID: transcode).map { ($0, transcode) }
+    }
+
+    /// The track's file on the server, read under `session`; nil when AVFoundation can't open it.
+    private func directURL(for track: PlexMetadata, session: String) -> URL? {
+        let media = track.Media?.first
+        guard Self.avFoundationPlays(media), let partKey = media?.Part?.first?.key,
+              let base = URL(string: connection.serverURL),
+              var components = URLComponents(url: base.appending(path: partKey), resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = (components.queryItems ?? []) + [
+            URLQueryItem(name: "X-Plex-Token", value: connection.token),
+            URLQueryItem(name: "X-Plex-Client-Identifier", value: PlexAPI.clientIdentifier),
+            URLQueryItem(name: "X-Plex-Platform", value: PlexAPI.platform),
+            URLQueryItem(name: "X-Plex-Product", value: PlexAPI.productName),
+            URLQueryItem(name: "X-Plex-Session-Identifier", value: session)
+        ]
+        return components.url
     }
 
     /// Codecs and containers AVFoundation opens on its own (as MacPlexSession).
@@ -659,7 +689,8 @@ final class CLIPlayer {
     /// "FLAC · 24-bit · 96 kHz", or the transcode it will be. Stream details
     /// come from the track's full metadata once it has been fetched.
     func quality(of track: PlexMetadata) -> String {
-        guard !connection.isRelay, Self.avFoundationPlays(track.Media?.first) else { return "AAC 320 (transcode)" }
+        let cached = isCached(track)
+        guard cached || !connection.isRelay, Self.avFoundationPlays(track.Media?.first) else { return "AAC 320 (transcode)" }
         let media = (track.ratingKey.flatMap { details[$0] } ?? track).Media?.first
         let audio = media?.Part?.first?.Stream?.first { $0.streamType == 2 }
         var parts = [(media?.audioCodec ?? "").uppercased()]
@@ -670,7 +701,7 @@ final class CLIPlayer {
         } else if let kbps = media?.bitrate {
             parts.append("\(kbps) kbps")
         }
-        if followed?.isLocal == true { parts.append("downloaded") }
+        if cached { parts.append("cached") }
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 

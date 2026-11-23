@@ -100,7 +100,6 @@ final class CLIApp {
     // MARK: - Run
 
     func run() async {
-        CLIPlayer.clearCache()
         artwork.onChange = { [weak self] in
             self?.nowPlaying?.update()
             self?.draw()
@@ -163,7 +162,10 @@ final class CLIApp {
 
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
-            MainActor.assumeIsolated { self?.pathChanged(online: path.status == .satisfied) }
+            MainActor.assumeIsolated {
+                self?.player.metered = path.isExpensive || path.isConstrained
+                self?.pathChanged(online: path.status == .satisfied)
+            }
         }
         monitor.start(queue: .main)
         pathMonitor = monitor
@@ -192,7 +194,6 @@ final class CLIApp {
                 await group.next()
                 group.cancelAll()
             }
-            CLIPlayer.clearCache()
             TTY.restore()
             exit(0)
         }

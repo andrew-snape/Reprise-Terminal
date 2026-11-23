@@ -29,6 +29,7 @@ Sources/reprise/
 │                       #   ask results), Now Playing screen, keys, drawing, reconnects
 ├── CLIAsk.swift        # "ask": Foundation Models reads a request, Plex finds the music
 ├── CLIArtwork.swift    # album cover: Plex photo transcode, Matrix-style drawing
+├── CLICache.swift      # 4 GB disk cache of whole audio files, least recently played out
 ├── CLINowPlaying.swift # Control Centre Now Playing (with cover) and media keys
 ├── CLIPlayer.swift     # AVQueuePlayer, direct/transcode URLs, queue editing, levelling,
 │                       #   slow-start download, saved queue, quality text, Plex reporting
@@ -165,10 +166,21 @@ Sources/reprise/
   `tick()` sees the change) is not scrobbled: it is held and retried once after 1 s, then
   skipped with a message. Two reads of one file on the session (a slow-start download
   beside AVPlayer's range reads) both complete: tested against the server, Nov 2026.
-- **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into
-  `$TMPDIR/reprise-cli` and swapped in at the same position if still waiting. A copy that
-  isn't used, or whose item is left, is deleted at once; the folder is also cleared on
-  launch and quit. Never on relay or for a transcode.
+- **Cache** (`CLICache`): whole direct-play files in `~/Library/Caches/reprise-cli/audio`
+  (0700), up to 4 GB, least recently played evicted (file modification date is "last
+  played"; the playing track and the next two are never evicted). Named
+  `<server>-<part id>-<part size>.<container>`, so a replaced file is a new name. Written
+  as `.part`, size checked against Plex's, then renamed; `.part` leftovers go on launch.
+  `source(for:)` plays a cached file first, even on relay. `readAhead` (every tick)
+  downloads the next two tracks, one at a time, under their own
+  `X-Plex-Session-Identifier` (a read open on the playing session makes Plex refuse
+  AVPlayer's request for that file); never on relay or a metered/constrained path. If the
+  queued follow-on's file lands with over 10 s of the current track left, it is swapped
+  for the file. A cached file that fails is deleted. The first track of a queue is only
+  cached by slow start.
+- **Slow start**: a direct-play item waiting over 1.5 s is downloaded whole into the
+  cache and swapped in at the same position if still waiting; if it started meanwhile,
+  the file stays cached. Never on relay or for a transcode.
 - **Levelling** (`L` toggles, on by default): `LoudnessLevelling.volume` from the track's full
   metadata (album gain when one album plays in order), set on the player when a track starts
   (the next item's on `didPlayToEndTime`, so no loud first moment).
