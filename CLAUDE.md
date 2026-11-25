@@ -97,6 +97,12 @@ Sources/reprise/
 - **Timeline reports** go out at once whenever the current `AVPlayerItem` differs from the
   last one reported, so manual skips and restarts are covered. The comparison is by item,
   not index.
+- **An artist's albums** come from the section filter (`artistAlbums`: `type=9&artist.id=`,
+  sorted newest first), not `/children`, which lists only full albums: EPs and singles
+  are left out (Coldplay: 10 of 19, no Blue Room EP), so an artist with only a single
+  looks empty (verified Nov 2026).
+  Hub search can likewise return a single's album without its track, so a song request
+  looks inside the best three albums when no track wins.
 - **Quality text** uses the track's full metadata (`getMetadata`, fetched lazily for the
   current track only): album `/children` lists lack stream details (bit depth, rate).
 - **Text is measured in terminal columns** (`String.columns`: wide CJK and emoji count
@@ -195,7 +201,8 @@ Sources/reprise/
   (the next item's on `didPlayToEndTime`, so no loud first moment).
 - **Next album** (`A` toggles, on by default, `CLIApp.queueNextAlbum`): once per track, when
   the last track of the queue starts and the queue holds every track of its album, the
-  artist's albums (`grandparentRatingKey` children) are sorted by `originallyAvailableAt`,
+  artist's full albums (`grandparentRatingKey` children, so no EPs or singles; all of
+  `artistAlbums` if the playing album is itself one of those) are sorted by `originallyAvailableAt`,
   then year (undated last), and the one after it is enqueued at the end, so it is gapless.
   Dropped if the track or the queue changed while fetching.
 - **Now Playing screen** (`v`, and opened whenever music is started: a track, `a`, `s`,

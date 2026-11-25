@@ -239,9 +239,23 @@ enum CLIAsk {
         if let artist, types.contains("album") || types.contains("track"),
            let found = winner(rank(candidates.values.filter { $0.type == "artist" }, title: artist, artist: nil)),
            let key = found.ratingKey {
-            let albums = try await network.getChildren(serverURL: connection.serverURL, authToken: connection.token,
-                                                       ratingKey: key)
+            let albums = try await network.artistAlbums(serverURL: connection.serverURL, authToken: connection.token,
+                                                        section: section, artistKey: key)
             for album in albums { if let k = album.ratingKey { candidates[k] = album } }
+        }
+
+        // Hub search can list a song's album but not the song (a new single, Nov 2026):
+        // look inside the best few albums.
+        if types.contains("track"), let title,
+           winner(rank(candidates.values.filter { $0.type == "track" }, title: title, artist: artist)) == nil {
+            let albums = rank(candidates.values.filter { $0.type == "album" }, title: title, artist: artist)
+            for album in albums.prefix(3) {
+                guard let key = album.item.ratingKey else { continue }
+                for track in try await network.getChildren(serverURL: connection.serverURL,
+                                                           authToken: connection.token, ratingKey: key) {
+                    if let k = track.ratingKey { candidates[k] = track }
+                }
+            }
         }
 
         let pool = candidates.values.filter { types.contains($0.type ?? "") }
@@ -749,6 +763,24 @@ enum CLIAsk {
             previous = current
         }
         return previous[b.count]
+    }
+}
+
+extension PlexNetworkManager {
+    /// An artist's albums, newest first (the order `/children` gives). Not from
+    /// `/children` itself: Plex lists only full albums there, leaving out EPs and
+    /// singles (verified Nov 2026).
+    func artistAlbums(serverURL: String, authToken: String, section: String?,
+                      artistKey: String) async throws -> [PlexMetadata] {
+        guard let id = section.flatMap({ Int($0) }) else {
+            return try await getChildren(serverURL: serverURL, authToken: authToken, ratingKey: artistKey)
+        }
+        return try await getAlbumsForArtist(serverURL: serverURL, authToken: authToken,
+                                            librarySectionId: id, artistId: artistKey)
+            .enumerated().sorted { l, r in
+                let (a, b) = (l.element.year ?? 0, r.element.year ?? 0)
+                return a != b ? a > b : l.offset < r.offset
+            }.map(\.element)
     }
 }
 
