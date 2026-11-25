@@ -305,6 +305,12 @@ final class CLIApp {
         return try await network.getChildren(serverURL: connection.serverURL, authToken: connection.token, ratingKey: key)
     }
 
+    private func albums(of artist: PlexMetadata) async throws -> [PlexMetadata] {
+        guard let key = artist.ratingKey else { return [] }
+        return try await network.artistAlbums(serverURL: connection.serverURL, authToken: connection.token,
+                                              section: library?.key, artistKey: key)
+    }
+
     private func push(_ page: Page) {
         stack.append(page)
         filtering = false
@@ -554,13 +560,21 @@ final class CLIApp {
         nextAlbumChecked = key
         let queued = Set(player.tracks.compactMap(\.ratingKey))
         let server = connection
+        let section = library?.key
         Task {
             func children(_ key: String) async -> [PlexMetadata] {
                 (try? await network.getChildren(serverURL: server.serverURL, authToken: server.token, ratingKey: key)) ?? []
             }
             let albumTracks = await children(albumKey)
             guard !albumTracks.isEmpty, albumTracks.allSatisfy({ $0.ratingKey.map(queued.contains) ?? false }) else { return }
-            let albums = Self.chronological(await children(artistKey).filter { $0.type == "album" })
+            // Full albums only (`/children` leaves out EPs and singles), unless that
+            // misses this one: then everything the artist has.
+            var artistAlbums = await children(artistKey)
+            if !artistAlbums.contains(where: { $0.ratingKey == albumKey }) {
+                artistAlbums = (try? await network.artistAlbums(serverURL: server.serverURL, authToken: server.token,
+                                                                section: section, artistKey: artistKey)) ?? []
+            }
+            let albums = Self.chronological(artistAlbums.filter { $0.type == "album" })
             guard let at = albums.firstIndex(where: { $0.ratingKey == albumKey }), at + 1 < albums.count,
                   let nextKey = albums[at + 1].ratingKey else { return }
             let tracks = await children(nextKey)
@@ -651,7 +665,7 @@ final class CLIApp {
         case .artists:
             guard let artist = row.item else { return }
             load { [self] in
-                let albums = try await children(of: artist)
+                let albums = try await albums(of: artist)
                 push(Page(kind: .albums, title: artist.title ?? "Artist", rows: albums.map {
                     Row(title: $0.title ?? "Untitled", detail: $0.year.map(String.init) ?? "", item: $0)
                 }))
@@ -679,7 +693,7 @@ final class CLIApp {
             switch item.type {
             case "artist":
                 load { [self] in
-                    let albums = try await children(of: item)
+                    let albums = try await albums(of: item)
                     push(Page(kind: .albums, title: item.title ?? "Artist", rows: albums.map {
                         Row(title: $0.title ?? "Untitled", detail: $0.year.map(String.init) ?? "", item: $0)
                     }))
