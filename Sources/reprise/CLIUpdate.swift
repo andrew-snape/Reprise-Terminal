@@ -15,7 +15,7 @@ import Foundation
 
 enum CLIUpdate {
     /// Must equal the release tag (without the "v") of the build that ships.
-    static let version = "0.1.5"
+    static let version = "0.1.6"
 
     private static let latestURL = URL(string: "https://api.github.com/repos/andrew-snape/Reprise-Terminal/releases/latest")!
     private static let sourceHint = "git pull && scripts/install.sh"
